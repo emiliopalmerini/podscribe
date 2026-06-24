@@ -7,7 +7,11 @@ const (
 	CodeAuth         = "auth_error"
 	CodeConfig       = "config_error"
 	CodeFilesystem   = "filesystem_error"
+	CodeForbidden    = "forbidden_error"
 	CodeInvalidInput = "invalid_input"
+	CodeNotFound     = "not_found"
+	CodeQuota        = "quota_error"
+	CodeRateLimited  = "rate_limited"
 	CodeNetwork      = "network_error"
 	CodeUnexpected   = "unexpected_error"
 )

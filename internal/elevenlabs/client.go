@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
-	"github.com/emiliopalmerini/podscribe/internal/output"
 )
 
 type Client struct {
@@ -285,7 +284,7 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		return nil, apperr.Wrap(apperr.CodeNetwork, "could not read ElevenLabs response", err)
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, apperr.New(apperr.CodeAPI, fmt.Sprintf("ElevenLabs API returned %s: %s", res.Status, output.Redact(compactBody(body))))
+		return nil, newAPIError(res, body)
 	}
 	return body, nil
 }

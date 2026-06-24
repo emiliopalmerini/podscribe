@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/emiliopalmerini/podscribe/internal/apperr"
 )
 
 func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
@@ -173,6 +175,127 @@ func TestAPIErrorIncludesStatus(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "400 Bad Request") {
 		t.Fatalf("error = %q, want status", err.Error())
+	}
+}
+
+func TestAPIErrorParsesProviderFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		headers  map[string]string
+		wantCode string
+		wantText []string
+	}{
+		{
+			name:   "quota exceeded overrides unauthorized status",
+			status: http.StatusUnauthorized,
+			body:   `{"detail":{"type":"invalid_request","code":"quota_exceeded","message":"This request exceeds your quota of 10000. You have 315 credits remaining, while 4366 credits are required for this request.","status":"quota_exceeded","request_id":"req_quota"}}`,
+			headers: map[string]string{
+				"x-trace-id": "trace_123",
+			},
+			wantCode: apperr.CodeQuota,
+			wantText: []string{
+				"ElevenLabs quota exceeded",
+				"315 credits remaining",
+				"request_id: req_quota",
+				"trace_id: trace_123",
+			},
+		},
+		{
+			name:     "auth failure",
+			status:   http.StatusUnauthorized,
+			body:     `{"detail":{"message":"Invalid API key"}}`,
+			wantCode: apperr.CodeAuth,
+			wantText: []string{"ElevenLabs authentication failed", "Invalid API key"},
+		},
+		{
+			name:     "forbidden",
+			status:   http.StatusForbidden,
+			body:     `{"detail":"IP address is not allowed"}`,
+			wantCode: apperr.CodeForbidden,
+			wantText: []string{"ElevenLabs request forbidden", "IP address is not allowed"},
+		},
+		{
+			name:     "not found",
+			status:   http.StatusNotFound,
+			body:     `{"detail":{"message":"Transcript not found"}}`,
+			wantCode: apperr.CodeNotFound,
+			wantText: []string{"ElevenLabs resource not found", "Transcript not found"},
+		},
+		{
+			name:   "validation array",
+			status: http.StatusUnprocessableEntity,
+			body: `{"detail":[
+				{"loc":["body","file"],"msg":"Field required","type":"missing"},
+				{"loc":["body","model_id"],"msg":"Input should be 'scribe_v2' or 'scribe_v1'","type":"enum"}
+			]}`,
+			wantCode: apperr.CodeInvalidInput,
+			wantText: []string{
+				"ElevenLabs request validation failed",
+				"body.file: Field required",
+				"body.model_id: Input should be",
+			},
+		},
+		{
+			name:   "rate limited",
+			status: http.StatusTooManyRequests,
+			body:   `{"detail":{"message":"Too many requests"}}`,
+			headers: map[string]string{
+				"retry-after": "30",
+			},
+			wantCode: apperr.CodeRateLimited,
+			wantText: []string{
+				"ElevenLabs rate limit exceeded",
+				"Too many requests",
+				"retry_after: 30",
+			},
+		},
+		{
+			name:     "invalid json fallback",
+			status:   http.StatusInternalServerError,
+			body:     "temporary upstream failure",
+			wantCode: apperr.CodeAPI,
+			wantText: []string{"ElevenLabs API returned 500 Internal Server Error", "temporary upstream failure"},
+		},
+		{
+			name:     "oversized body fallback is compacted",
+			status:   http.StatusBadGateway,
+			body:     strings.Repeat("x", 5000) + "tail-marker",
+			wantCode: apperr.CodeAPI,
+			wantText: []string{"ElevenLabs API returned 502 Bad Gateway", strings.Repeat("x", 100)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for name, value := range tt.headers {
+					w.Header().Set(name, value)
+				}
+				http.Error(w, tt.body, tt.status)
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "test-key")
+			client.HTTPClient = server.Client()
+
+			_, err := client.RawGet(context.Background(), "/v1/models")
+			if err == nil {
+				t.Fatal("RawGet() error = nil, want API error")
+			}
+			if got := apperr.Code(err); got != tt.wantCode {
+				t.Fatalf("error code = %q, want %q; error = %v", got, tt.wantCode, err)
+			}
+			for _, want := range tt.wantText {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want substring %q", err.Error(), want)
+				}
+			}
+			if strings.Contains(err.Error(), "tail-marker") {
+				t.Fatalf("error = %q, want compacted body without tail marker", err.Error())
+			}
+		})
 	}
 }
 

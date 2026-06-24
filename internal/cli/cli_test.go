@@ -158,6 +158,81 @@ func TestTranscribeJSONSuppressesUploadProgress(t *testing.T) {
 	}
 }
 
+func TestTranscribeQuotaErrorIsActionable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte(strings.Repeat("audio", 4096)), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	outPath := defaultTranscriptPath(audio)
+	server := newTranscribeQuotaTestServer(t)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want quota error")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	stderrText := stderr.String()
+	for _, want := range []string{
+		"Upload complete; waiting for ElevenLabs to transcribe",
+		"Error: ElevenLabs quota exceeded",
+		"315 credits remaining",
+		"request_id: req_quota",
+	} {
+		if !strings.Contains(stderrText, want) {
+			t.Fatalf("stderr = %q, want substring %q", stderrText, want)
+		}
+	}
+	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
+		t.Fatalf("transcript output exists or stat failed unexpectedly: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--json",
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute(--json) error = nil, want quota error")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var env struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if env.OK || env.Error.Code != "quota_error" {
+		t.Fatalf("quota JSON = %+v", env)
+	}
+	if !strings.Contains(env.Error.Message, "ElevenLabs quota exceeded") || !strings.Contains(env.Error.Message, "315 credits remaining") {
+		t.Fatalf("quota JSON message = %q", env.Error.Message)
+	}
+	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
+		t.Fatalf("transcript output exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestTranscribeTimestampFlagControlsMarkdownTimestamps(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ELEVENLABS_API_KEY", "")
@@ -244,5 +319,40 @@ func newTranscribeTestServer(t *testing.T) *httptest.Server {
 			t.Fatal("multipart request did not include file")
 		}
 		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello world.","words":[{"text":"Hello","start":1.2,"end":1.4,"type":"word"},{"text":"world.","start":1.5,"end":1.8,"type":"word"}],"transcription_id":"tx_123"}`))
+	}))
+}
+
+func newTranscribeQuotaTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		var sawFile bool
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			if part.FormName() == "file" {
+				sawFile = true
+			}
+			if _, err := io.Copy(io.Discard, part); err != nil {
+				t.Fatalf("read multipart part: %v", err)
+			}
+		}
+		if !sawFile {
+			t.Fatal("multipart request did not include file")
+		}
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"detail":{"type":"invalid_request","code":"quota_exceeded","message":"This request exceeds your quota of 10000. You have 315 credits remaining, while 4366 credits are required for this request.","status":"quota_exceeded","request_id":"req_quota"}}`))
 	}))
 }
