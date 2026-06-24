@@ -1,0 +1,24 @@
+# Go build outputs
+/podscribe
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go test and coverage artifacts
+*.out
+coverage.*
+*.coverprofile
+
+# Local Go workspace files
+go.work
+go.work.sum
+
+# Local environment files
+.env
+.env.*
+!.env.example
