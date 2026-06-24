@@ -14,11 +14,13 @@ import (
 )
 
 type MarkdownOptions struct {
-	Title       string
-	SourceFile  string
-	Model       string
+	Title      string
+	SourceFile string
+	Model      string
+
 	GeneratedAt time.Time
 	Diarized    bool
+	Timestamps  bool
 }
 
 type block struct {
@@ -49,7 +51,7 @@ func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
 				fmt.Fprintf(&b, "### Channel %d\n\n", i+1)
 			}
 		}
-		writeChunk(&b, chunk, opts.Diarized || hasSpeakers(chunk.Words))
+		writeChunk(&b, chunk, opts.Diarized || hasSpeakers(chunk.Words), opts.Timestamps)
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
@@ -92,7 +94,7 @@ func yamlString(b *strings.Builder, key, value string) {
 	fmt.Fprintf(b, "%s: %s\n", key, strconv.Quote(value))
 }
 
-func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized bool) {
+func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, timestamps bool) {
 	if len(chunk.Words) == 0 {
 		text := strings.TrimSpace(chunk.Text)
 		if text != "" {
@@ -105,11 +107,14 @@ func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized b
 	labels := speakerLabels(chunk.Words)
 	blocks := groupWords(chunk.Words)
 	for _, block := range blocks {
-		prefix := formatTimestamp(block.Start)
+		line := strings.TrimSpace(block.Text)
 		if diarized && block.Speaker != "" {
-			prefix += " " + labels[block.Speaker] + ":"
+			line = labels[block.Speaker] + ": " + line
 		}
-		fmt.Fprintf(b, "%s %s\n\n", prefix, strings.TrimSpace(block.Text))
+		if timestamps {
+			line = formatTimestamp(block.Start) + " " + line
+		}
+		fmt.Fprintf(b, "%s\n\n", line)
 	}
 }
 

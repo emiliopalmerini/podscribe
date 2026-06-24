@@ -158,6 +158,62 @@ func TestTranscribeJSONSuppressesUploadProgress(t *testing.T) {
 	}
 }
 
+func TestTranscribeTimestampFlagControlsMarkdownTimestamps(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	server := newTranscribeTestServer(t)
+	defer server.Close()
+
+	noTimestamps := filepath.Join(dir, "no-timestamps.md")
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", noTimestamps,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() without --timestamps error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	md, err := os.ReadFile(noTimestamps)
+	if err != nil {
+		t.Fatalf("read transcript without timestamps: %v", err)
+	}
+	if strings.Contains(string(md), "[00:00:01]") {
+		t.Fatalf("transcript included timestamps by default:\n%s", string(md))
+	}
+	if !strings.Contains(string(md), "Hello world.") {
+		t.Fatalf("transcript missing text:\n%s", string(md))
+	}
+
+	withTimestamps := filepath.Join(dir, "with-timestamps.md")
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", withTimestamps,
+		"--timestamps",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() with --timestamps error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	md, err = os.ReadFile(withTimestamps)
+	if err != nil {
+		t.Fatalf("read transcript with timestamps: %v", err)
+	}
+	if !strings.Contains(string(md), "[00:00:01] Hello world.") {
+		t.Fatalf("transcript missing timestamped text:\n%s", string(md))
+	}
+}
+
 func newTranscribeTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -187,6 +243,6 @@ func newTranscribeTestServer(t *testing.T) *httptest.Server {
 		if !sawFile {
 			t.Fatal("multipart request did not include file")
 		}
-		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello","words":[],"transcription_id":"tx_123"}`))
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello world.","words":[{"text":"Hello","start":1.2,"end":1.4,"type":"word"},{"text":"world.","start":1.5,"end":1.8,"type":"word"}],"transcription_id":"tx_123"}`))
 	}))
 }

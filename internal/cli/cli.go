@@ -183,6 +183,7 @@ func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command
 	cmd.Flags().StringVar(&flags.keytermsFile, "keyterms-file", "", "file with one keyterm per line")
 	cmd.Flags().BoolVar(&flags.clean, "clean", false, "remove fillers and non-speech artifacts where supported")
 	cmd.Flags().BoolVar(&flags.noAudioEvents, "no-audio-events", false, "disable audio event tags such as laughter")
+	cmd.Flags().BoolVar(&flags.timestamps, "timestamps", false, "include timestamps in Markdown transcript blocks")
 	cmd.Flags().StringVar(&flags.out, "out", "", "Markdown output path")
 	cmd.Flags().StringVar(&flags.rawOut, "raw-out", "", "optional raw ElevenLabs JSON output path")
 	cmd.Flags().BoolVar(&flags.force, "force", false, "overwrite existing output files")
@@ -198,6 +199,7 @@ type transcribeFlags struct {
 	keytermsFile  string
 	clean         bool
 	noAudioEvents bool
+	timestamps    bool
 	out           string
 	rawOut        string
 	force         bool
@@ -266,11 +268,13 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		fmt.Fprintln(opts.errOut, "Rendering Markdown transcript...")
 	}
 	md := render.Markdown(transcript, render.MarkdownOptions{
-		Title:       strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath)),
-		SourceFile:  filepath.Base(audioPath),
-		Model:       flags.model,
+		Title:      strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath)),
+		SourceFile: filepath.Base(audioPath),
+		Model:      flags.model,
+
 		GeneratedAt: time.Now().UTC(),
 		Diarized:    diarize,
+		Timestamps:  flags.timestamps,
 	})
 	if err := os.WriteFile(outPath, []byte(md), 0o644); err != nil {
 		return apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not write transcript to %s", outPath), err)

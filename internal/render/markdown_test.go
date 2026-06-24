@@ -38,12 +38,39 @@ func TestMarkdownRendersDiarizedTurns(t *testing.T) {
 		`transcription_id: "tx_123"`,
 		"diarized: true",
 		"# Episode 1",
-		"[00:00:01] Speaker 1: Hello world.",
-		"[00:00:06] Speaker 2: Thanks!",
+		"Speaker 1: Hello world.",
+		"Speaker 2: Thanks!",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Markdown() missing %q\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "[00:00:") {
+		t.Fatalf("Markdown() included timestamps by default:\n%s", got)
+	}
+}
+
+func TestMarkdownRendersTimestampsWhenRequested(t *testing.T) {
+	start, end := 61.2, 61.7
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		LanguageCode:    "en",
+		TranscriptionID: "tx_123",
+		Words: []elevenlabs.Word{
+			{Text: "Hello.", Type: "word", Start: &start, End: &end, SpeakerID: "speaker_0"},
+		},
+	}, MarkdownOptions{
+		Title:       "Episode 1",
+		SourceFile:  "episode.mp3",
+		Model:       "scribe_v2",
+		GeneratedAt: time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		Diarized:    true,
+		Timestamps:  true,
+	})
+
+	want := "[00:01:01] Speaker 1: Hello."
+	if !strings.Contains(got, want) {
+		t.Fatalf("Markdown() missing %q\n%s", want, got)
 	}
 }
 

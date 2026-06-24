@@ -51,6 +51,8 @@ By default, `podscribe` writes `episode.transcript.md` next to the audio file an
 
 Human-readable runs print upload progress to stderr, then keep reporting that the command is waiting for the ElevenLabs transcript response if server-side processing takes a while.
 
+Pass `--timestamps` to prefix transcript blocks with `[hh:mm:ss]` timestamps.
+
 Useful podcast flags:
 
 ```bash
@@ -129,10 +131,10 @@ generated_at: "2026-06-24T10:00:00Z"
 
 ## Transcript
 
-[00:00:01] Speaker 1: Welcome back.
+Speaker 1: Welcome back.
 ```
 
-Speaker labels are emitted only when diarization is requested or present in the response.
+Speaker labels are emitted only when diarization is requested or present in the response. Timestamps are emitted only when `--timestamps` is set.
 
 ## Development
 
