@@ -4,14 +4,6 @@
 
 ## Install
 
-From the repository:
-
-```bash
-go install ./cmd/podscribe
-```
-
-After publishing:
-
 ```bash
 go install github.com/emiliopalmerini/podscribe/cmd/podscribe@latest
 ```
