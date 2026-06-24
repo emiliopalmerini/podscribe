@@ -73,6 +73,7 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
+	var progress []UploadProgress
 	resp, raw, err := client.TranscribeFile(context.Background(), TranscribeOptions{
 		FilePath:              audio,
 		Model:                 "scribe_v2",
@@ -83,6 +84,9 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 		Clean:                 true,
 		TagAudioEvents:        false,
 		TimestampsGranularity: "word",
+		OnUploadProgress: func(update UploadProgress) {
+			progress = append(progress, update)
+		},
 	})
 	if err != nil {
 		t.Fatalf("TranscribeFile() error = %v", err)
@@ -95,6 +99,13 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 	}
 	if !json.Valid(raw) {
 		t.Fatalf("raw response is not JSON: %q", string(raw))
+	}
+	if len(progress) == 0 {
+		t.Fatal("upload progress was not reported")
+	}
+	lastProgress := progress[len(progress)-1]
+	if lastProgress.SentBytes != int64(len("fake audio")) || lastProgress.TotalBytes != int64(len("fake audio")) {
+		t.Fatalf("last progress = %+v, want sent and total %d", lastProgress, len("fake audio"))
 	}
 }
 

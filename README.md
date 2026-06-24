@@ -49,6 +49,8 @@ podscribe transcribe episode.mp3
 
 By default, `podscribe` writes `episode.transcript.md` next to the audio file and refuses to overwrite existing files unless `--force` is set.
 
+Human-readable runs print upload progress to stderr, then keep reporting that the command is waiting for the ElevenLabs transcript response if server-side processing takes a while.
+
 Useful podcast flags:
 
 ```bash

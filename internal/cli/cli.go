@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -203,7 +204,8 @@ type transcribeFlags struct {
 }
 
 func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags, audioPath string) error {
-	if err := validateAudioPath(audioPath); err != nil {
+	audioSize, err := validateAudioPath(audioPath)
+	if err != nil {
 		return err
 	}
 	if err := validateTranscribeFlags(flags); err != nil {
@@ -235,8 +237,10 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		return err
 	}
 	client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+	var progress *transcribeProgressPrinter
 	if !opts.json {
-		fmt.Fprintf(opts.errOut, "Uploading %s to ElevenLabs...\n", audioPath)
+		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs...\n", audioPath, formatBytes(audioSize))
+		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
 	diarize := flags.diarize || flags.speakers > 0
 	transcript, raw, err := client.TranscribeFile(ctx, elevenlabs.TranscribeOptions{
@@ -249,7 +253,11 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		Clean:                 flags.clean,
 		TagAudioEvents:        !flags.noAudioEvents,
 		TimestampsGranularity: "word",
+		OnUploadProgress:      progressCallback(progress),
 	})
+	if progress != nil {
+		progress.Stop()
+	}
 	if err != nil {
 		return err
 	}
@@ -433,15 +441,15 @@ func newRequestCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-func validateAudioPath(path string) error {
+func validateAudioPath(path string) (int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not read audio file %s", path), err)
+		return 0, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not read audio file %s", path), err)
 	}
 	if info.IsDir() {
-		return apperr.New(apperr.CodeInvalidInput, "audio path must be a file")
+		return 0, apperr.New(apperr.CodeInvalidInput, "audio path must be a file")
 	}
-	return nil
+	return info.Size(), nil
 }
 
 func validateTranscribeFlags(flags transcribeFlags) error {
@@ -532,4 +540,136 @@ func optionalString(value string) any {
 		return nil
 	}
 	return value
+}
+
+type transcribeProgressPrinter struct {
+	mu             sync.Mutex
+	w              io.Writer
+	lastUploadLine time.Time
+	uploadDone     bool
+	stopped        bool
+	waitStop       chan struct{}
+}
+
+const (
+	uploadProgressInterval = time.Second
+	transcribeWaitInterval = 30 * time.Second
+)
+
+func newTranscribeProgressPrinter(w io.Writer) *transcribeProgressPrinter {
+	return &transcribeProgressPrinter{
+		w:              w,
+		lastUploadLine: time.Now().Add(-uploadProgressInterval),
+		waitStop:       make(chan struct{}),
+	}
+}
+
+func progressCallback(progress *transcribeProgressPrinter) func(elevenlabs.UploadProgress) {
+	if progress == nil {
+		return nil
+	}
+	return progress.ReportUpload
+}
+
+func (p *transcribeProgressPrinter) ReportUpload(progress elevenlabs.UploadProgress) {
+	if progress.SentBytes == 0 {
+		return
+	}
+
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return
+	}
+
+	uploadComplete := progress.TotalBytes >= 0 && progress.SentBytes >= progress.TotalBytes
+	if !uploadComplete && now.Sub(p.lastUploadLine) < uploadProgressInterval {
+		return
+	}
+
+	fmt.Fprintf(p.w, "Uploaded %s / %s (%d%%)\n", formatBytes(progress.SentBytes), formatBytes(progress.TotalBytes), uploadPercent(progress.SentBytes, progress.TotalBytes))
+	p.lastUploadLine = now
+
+	if uploadComplete && !p.uploadDone {
+		p.uploadDone = true
+		p.startWaitingLocked(now)
+	}
+}
+
+func (p *transcribeProgressPrinter) startWaitingLocked(startedAt time.Time) {
+	if p.stopped {
+		return
+	}
+	fmt.Fprintln(p.w, "Upload complete; waiting for ElevenLabs to transcribe...")
+	go p.waitLoop(startedAt)
+}
+
+func (p *transcribeProgressPrinter) waitLoop(startedAt time.Time) {
+	ticker := time.NewTicker(transcribeWaitInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.mu.Lock()
+			if !p.stopped {
+				fmt.Fprintf(p.w, "Still waiting for ElevenLabs transcript response (elapsed %s)...\n", formatElapsed(time.Since(startedAt)))
+			}
+			p.mu.Unlock()
+		case <-p.waitStop:
+			return
+		}
+	}
+}
+
+func (p *transcribeProgressPrinter) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return
+	}
+	p.stopped = true
+	close(p.waitStop)
+}
+
+func uploadPercent(sent, total int64) int {
+	if total <= 0 {
+		return 100
+	}
+	if sent <= 0 {
+		return 0
+	}
+	percent := int(float64(sent) / float64(total) * 100)
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func formatBytes(bytes int64) string {
+	if bytes < 0 {
+		bytes = 0
+	}
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	value := float64(bytes)
+	for _, unit := range []string{"KiB", "MiB", "GiB", "TiB"} {
+		value /= 1024
+		if value < 1024 {
+			return fmt.Sprintf("%.1f %s", value, unit)
+		}
+	}
+	return fmt.Sprintf("%.1f PiB", value/1024)
+}
+
+func formatElapsed(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return d.String()
+	}
+	minutes := int(d / time.Minute)
+	seconds := int((d % time.Minute) / time.Second)
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
 }

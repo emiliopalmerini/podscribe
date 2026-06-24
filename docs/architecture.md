@@ -9,4 +9,4 @@
 - `internal/render` turns ElevenLabs word timing into editable Markdown transcript blocks.
 - `internal/output` owns the JSON envelope and secret redaction policy.
 
-The transcription upload uses `io.Pipe` with `multipart.Writer` so long podcast files are streamed to the HTTP request instead of buffered in memory.
+The transcription upload uses `io.Pipe` with `multipart.Writer` so long podcast files are streamed to the HTTP request instead of buffered in memory. The ElevenLabs client reports file-byte progress through a callback, and the CLI renders that progress only on stderr so JSON stdout remains parseable.

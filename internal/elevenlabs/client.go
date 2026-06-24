@@ -37,11 +37,17 @@ type TranscribeOptions struct {
 	Clean                 bool
 	TagAudioEvents        bool
 	TimestampsGranularity string
+	OnUploadProgress      func(UploadProgress)
 }
 
 type formField struct {
 	name  string
 	value string
+}
+
+type UploadProgress struct {
+	SentBytes  int64
+	TotalBytes int64
 }
 
 func NewClient(baseURL, apiKey string) *Client {
@@ -67,12 +73,26 @@ func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (Tr
 	if err != nil {
 		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not open audio file %s", opts.FilePath), err)
 	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", opts.FilePath), err)
+	}
 
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
+	if err != nil {
+		_ = file.Close()
+		_ = pw.CloseWithError(err)
+		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build transcription request", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("xi-api-key", c.APIKey)
+
 	go func() {
 		defer file.Close()
-		if err := writeTranscribeMultipart(writer, opts, file); err != nil {
+		if err := writeTranscribeMultipart(writer, opts, file, info.Size()); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
@@ -82,13 +102,6 @@ func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (Tr
 		}
 		_ = pw.Close()
 	}()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
-	if err != nil {
-		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build transcription request", err)
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("xi-api-key", c.APIKey)
 
 	raw, err := c.do(req)
 	if err != nil {
@@ -164,7 +177,7 @@ func (c *Client) RawGet(ctx context.Context, path string) ([]byte, error) {
 	return c.do(req)
 }
 
-func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, file *os.File) error {
+func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, file *os.File, totalBytes int64) error {
 	fields := []formField{
 		{name: "model_id", value: opts.Model},
 		{name: "timestamps_granularity", value: opts.TimestampsGranularity},
@@ -203,10 +216,35 @@ func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, 
 	if err != nil {
 		return apperr.Wrap(apperr.CodeFilesystem, "could not create multipart file part", err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
+	var reader io.Reader = file
+	if opts.OnUploadProgress != nil {
+		opts.OnUploadProgress(UploadProgress{SentBytes: 0, TotalBytes: totalBytes})
+		reader = &progressReader{
+			reader: file,
+			total:  totalBytes,
+			report: opts.OnUploadProgress,
+		}
+	}
+	if _, err := io.Copy(part, reader); err != nil {
 		return apperr.Wrap(apperr.CodeFilesystem, "could not stream audio file into multipart request", err)
 	}
 	return nil
+}
+
+type progressReader struct {
+	reader io.Reader
+	sent   int64
+	total  int64
+	report func(UploadProgress)
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.sent += int64(n)
+		r.report(UploadProgress{SentBytes: r.sent, TotalBytes: r.total})
+	}
+	return n, err
 }
 
 func escapeQuotes(s string) string {
