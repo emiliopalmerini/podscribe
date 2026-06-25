@@ -211,6 +211,32 @@ func TestRawGetDoesNotRetryAPIErrors(t *testing.T) {
 	}
 }
 
+func TestRawGetRetriesRateLimit(t *testing.T) {
+	var attempts int
+	client := NewClient("https://api.example", "test-key")
+	client.retryBaseDelay = 0
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			res := jsonResponse(req, http.StatusTooManyRequests, `{"detail":{"message":"Too many requests"}}`)
+			res.Header.Set("retry-after", "0")
+			return res, nil
+		}
+		return jsonResponse(req, http.StatusOK, `{"models":[]}`), nil
+	})}
+
+	raw, err := client.RawGet(context.Background(), "/v1/models")
+	if err != nil {
+		t.Fatalf("RawGet() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("raw response is not JSON: %q", string(raw))
+	}
+}
+
 func TestTranscribeFileRetriesConnectionErrorsWithFreshMultipartRequest(t *testing.T) {
 	audio := t.TempDir() + "/episode.mp3"
 	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
@@ -395,6 +421,7 @@ func TestAPIErrorParsesProviderFailures(t *testing.T) {
 
 			client := NewClient(server.URL, "test-key")
 			client.HTTPClient = server.Client()
+			client.retryAttempts = 1
 
 			_, err := client.RawGet(context.Background(), "/v1/models")
 			if err == nil {

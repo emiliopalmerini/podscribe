@@ -306,11 +306,16 @@ func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*ht
 			}
 			continue
 		}
-		defer res.Body.Close()
-
 		body, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
 		if err != nil {
 			return nil, apperr.Wrap(apperr.CodeNetwork, "could not read ElevenLabs response", err)
+		}
+		if shouldRetryRateLimit(res.StatusCode, attempt, attempts) {
+			if err := sleepContext(ctx, c.rateLimitRetryDelay(res.Header.Get("retry-after"), attempt)); err != nil {
+				return nil, apperr.Wrap(apperr.CodeNetwork, "request to ElevenLabs failed", err)
+			}
+			continue
 		}
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
 			return nil, newAPIError(res, body)
@@ -318,6 +323,10 @@ func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*ht
 		return body, nil
 	}
 	return nil, apperr.New(apperr.CodeNetwork, "request to ElevenLabs failed")
+}
+
+func shouldRetryRateLimit(statusCode, attempt, attempts int) bool {
+	return statusCode == http.StatusTooManyRequests && attempt < attempts
 }
 
 func (c *Client) attempts() int {
@@ -342,6 +351,34 @@ func (c *Client) retryDelay(attempt int) time.Duration {
 		return defaultRetryMaxDelay
 	}
 	return delay
+}
+
+func (c *Client) rateLimitRetryDelay(retryAfter string, attempt int) time.Duration {
+	if delay, ok := parseRetryAfter(retryAfter, time.Now()); ok {
+		return delay
+	}
+	return c.retryDelay(attempt)
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	if !when.After(now) {
+		return 0, true
+	}
+	return when.Sub(now), true
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
