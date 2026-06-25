@@ -289,6 +289,129 @@ func TestTranscribeTimestampFlagControlsMarkdownTimestamps(t *testing.T) {
 	}
 }
 
+func TestTranscribeSpeakerNamesImplyDiarizationAndRenderNames(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	outPath := filepath.Join(dir, "named.md")
+	var fields map[string][]string
+	server := newTranscribeFieldsTestServer(t, &fields, `{"language_code":"en","text":"Hello. Thanks!","words":[{"text":"Hello.","start":1.2,"end":1.4,"type":"word","speaker_id":"speaker_0"},{"text":"Thanks!","start":2.5,"end":2.8,"type":"word","speaker_id":"speaker_1"}],"transcription_id":"tx_123"}`)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", outPath,
+		"--speaker-name", "Emilio Palmerini",
+		"--speaker-name", "Guest",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	md, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	for _, want := range []string{
+		"Emilio Palmerini: Hello.",
+		"Guest: Thanks!",
+	} {
+		if !strings.Contains(string(md), want) {
+			t.Fatalf("transcript missing %q:\n%s", want, string(md))
+		}
+	}
+	if got := strings.Join(fields["diarize"], "|"); got != "true" {
+		t.Fatalf("diarize fields = %q, want true", got)
+	}
+	if got := strings.Join(fields["num_speakers"], "|"); got != "2" {
+		t.Fatalf("num_speakers fields = %q, want 2", got)
+	}
+}
+
+func TestTranscribeSpeakerNamesFileAndFlagsAppendInOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	namesPath := filepath.Join(dir, "speakers.txt")
+	if err := os.WriteFile(namesPath, []byte("# regular speakers\nEmilio\n\nGuest\n"), 0o644); err != nil {
+		t.Fatalf("write speaker names: %v", err)
+	}
+	outPath := filepath.Join(dir, "named.md")
+	var fields map[string][]string
+	server := newTranscribeFieldsTestServer(t, &fields, `{"language_code":"en","text":"One. Two. Three.","words":[{"text":"One.","start":1.2,"end":1.4,"type":"word","speaker_id":"speaker_0"},{"text":"Two.","start":2.5,"end":2.8,"type":"word","speaker_id":"speaker_1"},{"text":"Three.","start":3.5,"end":3.8,"type":"word","speaker_id":"speaker_2"}],"transcription_id":"tx_123"}`)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", outPath,
+		"--speaker-names-file", namesPath,
+		"--speaker-name", "Producer",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	md, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	for _, want := range []string{
+		"Emilio: One.",
+		"Guest: Two.",
+		"Producer: Three.",
+	} {
+		if !strings.Contains(string(md), want) {
+			t.Fatalf("transcript missing %q:\n%s", want, string(md))
+		}
+	}
+	if got := strings.Join(fields["num_speakers"], "|"); got != "3" {
+		t.Fatalf("num_speakers fields = %q, want 3", got)
+	}
+}
+
+func TestTranscribeRejectsMoreSpeakerNamesThanExplicitSpeakers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	audio := filepath.Join(t.TempDir(), "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcribe", audio,
+		"--speakers", "1",
+		"--speaker-name", "Emilio",
+		"--speaker-name", "Guest",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want speaker count validation error")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--speakers must be at least the number of speaker names") {
+		t.Fatalf("stderr = %q, want speaker count validation error", stderr.String())
+	}
+}
+
 func newTranscribeTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +442,47 @@ func newTranscribeTestServer(t *testing.T) *httptest.Server {
 			t.Fatal("multipart request did not include file")
 		}
 		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello world.","words":[{"text":"Hello","start":1.2,"end":1.4,"type":"word"},{"text":"world.","start":1.5,"end":1.8,"type":"word"}],"transcription_id":"tx_123"}`))
+	}))
+}
+
+func newTranscribeFieldsTestServer(t *testing.T, fields *map[string][]string, response string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		gotFields := make(map[string][]string)
+		var sawFile bool
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			if part.FormName() == "file" {
+				sawFile = true
+				if _, err := io.Copy(io.Discard, part); err != nil {
+					t.Fatalf("read multipart file part: %v", err)
+				}
+				continue
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("read multipart field: %v", err)
+			}
+			gotFields[part.FormName()] = append(gotFields[part.FormName()], string(b))
+		}
+		if !sawFile {
+			t.Fatal("multipart request did not include file")
+		}
+		*fields = gotFields
+		_, _ = w.Write([]byte(response))
 	}))
 }
 

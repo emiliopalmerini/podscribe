@@ -51,10 +51,20 @@ Useful podcast flags:
 podscribe transcribe episode.mp3 \
   --diarize \
   --speakers 2 \
+  --speaker-name "Emilio Palmerini" \
+  --speaker-name "Guest" \
   --keyterm "Emilio Palmerini" \
   --keyterms-file terms.txt \
   --clean
 ```
+
+Speaker names are assigned by first detected speaker order and rendered in Markdown instead of generic labels. You can also keep recurring names in a file:
+
+```bash
+podscribe transcribe episode.mp3 --speaker-names-file speakers.txt
+```
+
+`speakers.txt` uses one name per line. Blank lines and lines starting with `#` are ignored. Speaker names imply diarization; when `--speakers` is omitted, podscribe sends the number of supplied names as the speaker count.
 
 Save the raw ElevenLabs JSON alongside the Markdown:
 
@@ -126,7 +136,7 @@ generated_at: "2026-06-24T10:00:00Z"
 Speaker 1: Welcome back.
 ```
 
-Speaker labels are emitted only when diarization is requested or present in the response. Timestamps are emitted only when `--timestamps` is set.
+Speaker labels are emitted when diarization is requested or speaker IDs are present in the response; provided names replace the generated labels when speaker IDs are available. Timestamps are emitted only when `--timestamps` is set.
 
 ## Development
 

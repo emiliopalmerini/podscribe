@@ -74,6 +74,137 @@ func TestMarkdownRendersTimestampsWhenRequested(t *testing.T) {
 	}
 }
 
+func TestMarkdownRendersNamedSpeakers(t *testing.T) {
+	start0, end0 := 1.2, 1.7
+	start1, end1 := 2.0, 2.4
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		LanguageCode:    "en",
+		TranscriptionID: "tx_123",
+		Words: []elevenlabs.Word{
+			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
+			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
+		},
+	}, MarkdownOptions{
+		Title:        "Episode 1",
+		SourceFile:   "episode.mp3",
+		Model:        "scribe_v2",
+		GeneratedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		Diarized:     true,
+		SpeakerNames: []string{"Emilio Palmerini", "Guest"},
+	})
+
+	for _, want := range []string{
+		"Emilio Palmerini: Hello.",
+		"Guest: Thanks!",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Markdown() missing %q\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Speaker 1") || strings.Contains(got, "Speaker 2") {
+		t.Fatalf("Markdown() included fallback speaker labels:\n%s", got)
+	}
+}
+
+func TestMarkdownFallsBackForUnnamedSpeakers(t *testing.T) {
+	start0, end0 := 1.2, 1.7
+	start1, end1 := 2.0, 2.4
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		LanguageCode:    "en",
+		TranscriptionID: "tx_123",
+		Words: []elevenlabs.Word{
+			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
+			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
+		},
+	}, MarkdownOptions{
+		Title:        "Episode 1",
+		SourceFile:   "episode.mp3",
+		Model:        "scribe_v2",
+		GeneratedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		Diarized:     true,
+		SpeakerNames: []string{"Emilio"},
+	})
+
+	for _, want := range []string{
+		"Emilio: Hello.",
+		"Speaker 2: Thanks!",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Markdown() missing %q\n%s", want, got)
+		}
+	}
+}
+
+func TestMarkdownRendersNamedSpeakerWithTimestamps(t *testing.T) {
+	start, end := 61.2, 61.7
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		LanguageCode:    "en",
+		TranscriptionID: "tx_123",
+		Words: []elevenlabs.Word{
+			{Text: "Hello.", Type: "word", Start: &start, End: &end, SpeakerID: "speaker_0"},
+		},
+	}, MarkdownOptions{
+		Title:        "Episode 1",
+		SourceFile:   "episode.mp3",
+		Model:        "scribe_v2",
+		GeneratedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		Diarized:     true,
+		Timestamps:   true,
+		SpeakerNames: []string{"Emilio"},
+	})
+
+	want := "[00:01:01] Emilio: Hello."
+	if !strings.Contains(got, want) {
+		t.Fatalf("Markdown() missing %q\n%s", want, got)
+	}
+}
+
+func TestMarkdownKeepsSpeakerLabelsStableAcrossChunks(t *testing.T) {
+	start0, end0 := 1.2, 1.7
+	start1, end1 := 2.0, 2.4
+	channel0, channel1 := 0, 1
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		Transcripts: []elevenlabs.TranscriptChunk{
+			{
+				LanguageCode: "en",
+				ChannelIndex: &channel0,
+				Words: []elevenlabs.Word{
+					{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
+				},
+			},
+			{
+				LanguageCode: "en",
+				ChannelIndex: &channel1,
+				Words: []elevenlabs.Word{
+					{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
+				},
+			},
+		},
+	}, MarkdownOptions{
+		Title:        "Episode 1",
+		SourceFile:   "episode.mp3",
+		Model:        "scribe_v2",
+		GeneratedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		Diarized:     true,
+		SpeakerNames: []string{"Emilio", "Guest"},
+	})
+
+	for _, want := range []string{
+		"### Channel 0",
+		"Emilio: Hello.",
+		"### Channel 1",
+		"Guest: Thanks!",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Markdown() missing %q\n%s", want, got)
+		}
+	}
+}
+
 func TestMarkdownFallsBackToPlainText(t *testing.T) {
 	got := Markdown(elevenlabs.TranscriptResponse{
 		LanguageCode: "en",

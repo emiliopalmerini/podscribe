@@ -179,6 +179,8 @@ func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command
 	cmd.Flags().StringVar(&flags.language, "language", "", "optional ISO-639 language code")
 	cmd.Flags().BoolVar(&flags.diarize, "diarize", false, "annotate speaker turns")
 	cmd.Flags().IntVar(&flags.speakers, "speakers", 0, "maximum number of speakers; implies --diarize")
+	cmd.Flags().StringArrayVar(&flags.speakerNames, "speaker-name", nil, "speaker display name; repeatable and ordered by detected speaker")
+	cmd.Flags().StringVar(&flags.speakerNamesFile, "speaker-names-file", "", "file with one speaker display name per line")
 	cmd.Flags().StringArrayVar(&flags.keyterms, "keyterm", nil, "custom vocabulary term; repeatable")
 	cmd.Flags().StringVar(&flags.keytermsFile, "keyterms-file", "", "file with one keyterm per line")
 	cmd.Flags().BoolVar(&flags.clean, "clean", false, "remove fillers and non-speech artifacts where supported")
@@ -191,18 +193,20 @@ func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command
 }
 
 type transcribeFlags struct {
-	model         string
-	language      string
-	diarize       bool
-	speakers      int
-	keyterms      []string
-	keytermsFile  string
-	clean         bool
-	noAudioEvents bool
-	timestamps    bool
-	out           string
-	rawOut        string
-	force         bool
+	model            string
+	language         string
+	diarize          bool
+	speakers         int
+	speakerNames     []string
+	speakerNamesFile string
+	keyterms         []string
+	keytermsFile     string
+	clean            bool
+	noAudioEvents    bool
+	timestamps       bool
+	out              string
+	rawOut           string
+	force            bool
 }
 
 func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags, audioPath string) error {
@@ -219,6 +223,17 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 	}
 	if err := validateKeyterms(keyterms); err != nil {
 		return err
+	}
+	speakerNames, err := collectSpeakerNames(flags.speakerNames, flags.speakerNamesFile)
+	if err != nil {
+		return err
+	}
+	if err := validateSpeakerNames(speakerNames, flags.speakers); err != nil {
+		return err
+	}
+	speakers := flags.speakers
+	if speakers == 0 && len(speakerNames) > 0 {
+		speakers = len(speakerNames)
 	}
 
 	outPath := flags.out
@@ -244,13 +259,13 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs...\n", audioPath, formatBytes(audioSize))
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
-	diarize := flags.diarize || flags.speakers > 0
+	diarize := flags.diarize || speakers > 0 || len(speakerNames) > 0
 	transcript, raw, err := client.TranscribeFile(ctx, elevenlabs.TranscribeOptions{
 		FilePath:              audioPath,
 		Model:                 flags.model,
 		Language:              flags.language,
 		Diarize:               diarize,
-		Speakers:              flags.speakers,
+		Speakers:              speakers,
 		Keyterms:              keyterms,
 		Clean:                 flags.clean,
 		TagAudioEvents:        !flags.noAudioEvents,
@@ -272,9 +287,10 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		SourceFile: filepath.Base(audioPath),
 		Model:      flags.model,
 
-		GeneratedAt: time.Now().UTC(),
-		Diarized:    diarize,
-		Timestamps:  flags.timestamps,
+		GeneratedAt:  time.Now().UTC(),
+		Diarized:     diarize,
+		Timestamps:   flags.timestamps,
+		SpeakerNames: speakerNames,
 	})
 	if err := os.WriteFile(outPath, []byte(md), 0o644); err != nil {
 		return apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not write transcript to %s", outPath), err)
@@ -515,6 +531,44 @@ func validateKeyterms(terms []string) error {
 		if strings.ContainsAny(term, `<>[]{}\`) {
 			return apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("keyterm %q contains unsupported characters", term))
 		}
+	}
+	return nil
+}
+
+func collectSpeakerNames(flagNames []string, filePath string) ([]string, error) {
+	names := make([]string, 0, len(flagNames))
+	if filePath != "" {
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not read speaker names file %s", filePath), err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			names = append(names, line)
+		}
+	}
+	for _, name := range flagNames {
+		if strings.ContainsAny(name, "\r\n") {
+			return nil, apperr.New(apperr.CodeInvalidInput, "--speaker-name cannot contain newlines")
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, apperr.New(apperr.CodeInvalidInput, "--speaker-name cannot be empty")
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func validateSpeakerNames(names []string, speakers int) error {
+	if len(names) > 32 {
+		return apperr.New(apperr.CodeInvalidInput, "speaker names cannot exceed 32 entries")
+	}
+	if speakers > 0 && len(names) > speakers {
+		return apperr.New(apperr.CodeInvalidInput, "--speakers must be at least the number of speaker names")
 	}
 	return nil
 }

@@ -18,9 +18,10 @@ type MarkdownOptions struct {
 	SourceFile string
 	Model      string
 
-	GeneratedAt time.Time
-	Diarized    bool
-	Timestamps  bool
+	GeneratedAt  time.Time
+	Diarized     bool
+	Timestamps   bool
+	SpeakerNames []string
 }
 
 type block struct {
@@ -43,6 +44,8 @@ func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
 	fmt.Fprintf(&b, "## Transcript\n\n")
 
 	chunks := resp.Chunks()
+	diarized := opts.Diarized || hasSpeakers(chunks)
+	labels := speakerLabels(chunks, opts.SpeakerNames)
 	for i, chunk := range chunks {
 		if len(chunks) > 1 {
 			if chunk.ChannelIndex != nil {
@@ -51,7 +54,7 @@ func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
 				fmt.Fprintf(&b, "### Channel %d\n\n", i+1)
 			}
 		}
-		writeChunk(&b, chunk, opts.Diarized || hasSpeakers(chunk.Words), opts.Timestamps)
+		writeChunk(&b, chunk, diarized, opts.Timestamps, labels)
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
@@ -81,7 +84,7 @@ func writeFrontMatter(b *strings.Builder, resp elevenlabs.TranscriptResponse, op
 		fmt.Fprintf(b, "audio_duration_secs: %s\n", strconv.FormatFloat(*duration, 'f', -1, 64))
 	}
 	yamlString(b, "transcription_id", transcriptionID)
-	fmt.Fprintf(b, "diarized: %t\n", opts.Diarized || hasSpeakers(first.Words))
+	fmt.Fprintf(b, "diarized: %t\n", opts.Diarized || hasSpeakers(chunks))
 	yamlString(b, "generated_at", opts.GeneratedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintln(b, "---")
 	fmt.Fprintln(b)
@@ -94,7 +97,7 @@ func yamlString(b *strings.Builder, key, value string) {
 	fmt.Fprintf(b, "%s: %s\n", key, strconv.Quote(value))
 }
 
-func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, timestamps bool) {
+func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, timestamps bool, labels map[string]string) {
 	if len(chunk.Words) == 0 {
 		text := strings.TrimSpace(chunk.Text)
 		if text != "" {
@@ -104,7 +107,6 @@ func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, 
 		return
 	}
 
-	labels := speakerLabels(chunk.Words)
 	blocks := groupWords(chunk.Words)
 	for _, block := range blocks {
 		line := strings.TrimSpace(block.Text)
@@ -218,31 +220,39 @@ func endsSentence(s string) bool {
 	return strings.HasSuffix(s, ".") || strings.HasSuffix(s, "!") || strings.HasSuffix(s, "?")
 }
 
-func speakerLabels(words []elevenlabs.Word) map[string]string {
+func speakerLabels(chunks []elevenlabs.TranscriptChunk, names []string) map[string]string {
 	labels := make(map[string]string)
-	for _, word := range words {
-		if word.SpeakerID == "" {
-			continue
-		}
-		if _, ok := labels[word.SpeakerID]; ok {
-			continue
-		}
-		switch strings.ToLower(word.SpeakerID) {
-		case "agent":
-			labels[word.SpeakerID] = "Agent"
-		case "customer":
-			labels[word.SpeakerID] = "Customer"
-		default:
-			labels[word.SpeakerID] = fmt.Sprintf("Speaker %d", len(labels)+1)
+	for _, chunk := range chunks {
+		for _, word := range chunk.Words {
+			if word.SpeakerID == "" {
+				continue
+			}
+			if _, ok := labels[word.SpeakerID]; ok {
+				continue
+			}
+			if len(labels) < len(names) {
+				labels[word.SpeakerID] = names[len(labels)]
+				continue
+			}
+			switch strings.ToLower(word.SpeakerID) {
+			case "agent":
+				labels[word.SpeakerID] = "Agent"
+			case "customer":
+				labels[word.SpeakerID] = "Customer"
+			default:
+				labels[word.SpeakerID] = fmt.Sprintf("Speaker %d", len(labels)+1)
+			}
 		}
 	}
 	return labels
 }
 
-func hasSpeakers(words []elevenlabs.Word) bool {
-	for _, word := range words {
-		if word.SpeakerID != "" {
-			return true
+func hasSpeakers(chunks []elevenlabs.TranscriptChunk) bool {
+	for _, chunk := range chunks {
+		for _, word := range chunk.Words {
+			if word.SpeakerID != "" {
+				return true
+			}
 		}
 	}
 	return false
