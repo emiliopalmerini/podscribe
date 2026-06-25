@@ -12,6 +12,18 @@ type TranscriptResponse struct {
 	Transcripts         []TranscriptChunk `json:"transcripts,omitempty"`
 }
 
+type UserResponse struct {
+	UserID    string `json:"user_id"`
+	SeatType  string `json:"seat_type,omitempty"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+}
+
+type WebhookResponse struct {
+	Message         string  `json:"message"`
+	RequestID       string  `json:"request_id"`
+	TranscriptionID *string `json:"transcription_id,omitempty"`
+}
+
 type TranscriptChunk struct {
 	LanguageCode        string           `json:"language_code,omitempty"`
 	LanguageProbability float64          `json:"language_probability,omitempty"`

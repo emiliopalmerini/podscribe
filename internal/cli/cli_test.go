@@ -385,6 +385,200 @@ func TestTranscribeSpeakerNamesFileAndFlagsAppendInOrder(t *testing.T) {
 	}
 }
 
+func TestTranscribeReusesCompletedJobCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	server, postCount := newCacheTestServer(t)
+	defer server.Close()
+
+	firstOut := filepath.Join(dir, "first.md")
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--json",
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", firstOut,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("first Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	secondOut := filepath.Join(dir, "second.md")
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--json",
+		"--api-key", "rotated-test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", secondOut,
+		"--timestamps",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("second Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if *postCount != 1 {
+		t.Fatalf("transcribe POST count = %d, want 1", *postCount)
+	}
+	var env struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			CacheStatus string `json:"cache_status"`
+			ReusedCache bool   `json:"reused_cache"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if !env.OK || env.Data.CacheStatus != "hit" || !env.Data.ReusedCache {
+		t.Fatalf("cache JSON = %+v", env)
+	}
+	md, err := os.ReadFile(secondOut)
+	if err != nil {
+		t.Fatalf("read cached transcript: %v", err)
+	}
+	if !strings.Contains(string(md), "[00:00:01] Hello world.") {
+		t.Fatalf("cached transcript was not re-rendered with current timestamp flag:\n%s", string(md))
+	}
+}
+
+func TestTranscribeSubmittedJobBlocksAutomaticRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	server, postCount := newCacheTestServer(t)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--webhook",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("webhook Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want submitted job retry block")
+	}
+	if *postCount != 1 {
+		t.Fatalf("transcribe POST count = %d, want 1", *postCount)
+	}
+	if !strings.Contains(stderr.String(), "is submitted") || !strings.Contains(stderr.String(), "--force") {
+		t.Fatalf("stderr = %q, want submitted retry guidance", stderr.String())
+	}
+}
+
+func TestImportWebhookCompletesJobCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	server, postCount := newCacheTestServer(t)
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--json",
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--webhook",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("webhook Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	var submitted struct {
+		Data struct {
+			JobKey string `json:"job_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &submitted); err != nil {
+		t.Fatalf("webhook stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if submitted.Data.JobKey == "" {
+		t.Fatalf("missing job key in webhook output: %s", stdout.String())
+	}
+
+	importOut := filepath.Join(dir, "imported.md")
+	importRaw := filepath.Join(dir, "imported.json")
+	payload := `{
+		"webhook_metadata": {"podscribe_job_key": "` + submitted.Data.JobKey + `"},
+		"data": {
+			"language_code": "en",
+			"text": "Hello world.",
+			"words": [
+				{"text":"Hello","start":1.2,"end":1.4,"type":"word"},
+				{"text":"world.","start":1.5,"end":1.8,"type":"word"}
+			],
+			"transcription_id": "tx_webhook"
+		}
+	}`
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--json",
+		"transcripts", "import-webhook", "-",
+		"--out", importOut,
+		"--raw-out", importRaw,
+	}, strings.NewReader(payload), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("import webhook Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	md, err := os.ReadFile(importOut)
+	if err != nil {
+		t.Fatalf("read imported markdown: %v", err)
+	}
+	if !strings.Contains(string(md), "Hello world.") {
+		t.Fatalf("imported markdown missing transcript:\n%s", string(md))
+	}
+	if _, err := os.Stat(importRaw); err != nil {
+		t.Fatalf("raw import was not written: %v", err)
+	}
+
+	rerunOut := filepath.Join(dir, "rerun.md")
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"--json",
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe", audio,
+		"--out", rerunOut,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("rerun Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if *postCount != 1 {
+		t.Fatalf("transcribe POST count = %d, want only webhook submit POST", *postCount)
+	}
+}
+
 func TestTranscribeRejectsMoreSpeakerNamesThanExplicitSpeakers(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ELEVENLABS_API_KEY", "")
@@ -415,6 +609,10 @@ func TestTranscribeRejectsMoreSpeakerNamesThanExplicitSpeakers(t *testing.T) {
 func newTranscribeTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1,"xi_api_key":"should-not-be-used"}`))
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
@@ -448,6 +646,10 @@ func newTranscribeTestServer(t *testing.T) *httptest.Server {
 func newTranscribeFieldsTestServer(t *testing.T, fields *map[string][]string, response string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1,"xi_api_key":"should-not-be-used"}`))
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
@@ -486,9 +688,64 @@ func newTranscribeFieldsTestServer(t *testing.T, fields *map[string][]string, re
 	}))
 }
 
+func newCacheTestServer(t *testing.T) (*httptest.Server, *int) {
+	t.Helper()
+	postCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1,"xi_api_key":"should-not-be-used"}`))
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		postCount++
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		fields := make(map[string][]string)
+		var sawFile bool
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			if part.FormName() == "file" {
+				sawFile = true
+				if _, err := io.Copy(io.Discard, part); err != nil {
+					t.Fatalf("read multipart file part: %v", err)
+				}
+				continue
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("read multipart field: %v", err)
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(b))
+		}
+		if !sawFile {
+			t.Fatal("multipart request did not include file")
+		}
+		if strings.Join(fields["webhook"], "|") == "true" {
+			_, _ = w.Write([]byte(`{"message":"Request accepted. Transcription result will be sent to the webhook.","request_id":"req_webhook","transcription_id":"tx_webhook_ack"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello world.","words":[{"text":"Hello","start":1.2,"end":1.4,"type":"word"},{"text":"world.","start":1.5,"end":1.8,"type":"word"}],"transcription_id":"tx_123"}`))
+	}))
+	return server, &postCount
+}
+
 func newTranscribeQuotaTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1,"xi_api_key":"should-not-be-used"}`))
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}

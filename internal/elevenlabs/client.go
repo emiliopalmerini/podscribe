@@ -46,6 +46,9 @@ type TranscribeOptions struct {
 	Clean                 bool
 	TagAudioEvents        bool
 	TimestampsGranularity string
+	Webhook               bool
+	WebhookID             string
+	WebhookMetadata       map[string]any
 	OnUploadProgress      func(UploadProgress)
 }
 
@@ -91,6 +94,29 @@ func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (Tr
 		return TranscriptResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs transcript response", err)
 	}
 	return transcript, raw, nil
+}
+
+func (c *Client) SubmitTranscriptionWebhook(ctx context.Context, opts TranscribeOptions) (WebhookResponse, []byte, error) {
+	if c.APIKey == "" {
+		return WebhookResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
+	}
+	endpoint, err := c.endpoint("/v1/speech-to-text")
+	if err != nil {
+		return WebhookResponse{}, nil, err
+	}
+	opts.Webhook = true
+
+	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newTranscribeRequest(ctx, endpoint, opts)
+	})
+	if err != nil {
+		return WebhookResponse{}, nil, err
+	}
+	var response WebhookResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return WebhookResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs webhook response", err)
+	}
+	return response, raw, nil
 }
 
 func (c *Client) newTranscribeRequest(ctx context.Context, endpoint string, opts TranscribeOptions) (*http.Request, error) {
@@ -165,6 +191,30 @@ func (c *Client) DeleteTranscript(ctx context.Context, id string) ([]byte, error
 	})
 }
 
+func (c *Client) GetUser(ctx context.Context) (UserResponse, []byte, error) {
+	if c.APIKey == "" {
+		return UserResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
+	}
+	endpoint, err := c.endpoint("/v1/user")
+	if err != nil {
+		return UserResponse{}, nil, err
+	}
+	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newAPIRequest(ctx, http.MethodGet, endpoint, "could not build get user request")
+	})
+	if err != nil {
+		return UserResponse{}, nil, err
+	}
+	var user UserResponse
+	if err := json.Unmarshal(raw, &user); err != nil {
+		return UserResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs user response", err)
+	}
+	if strings.TrimSpace(user.UserID) == "" {
+		return UserResponse{}, raw, apperr.New(apperr.CodeAPI, "ElevenLabs user response did not include user_id")
+	}
+	return user, raw, nil
+}
+
 func (c *Client) RawGet(ctx context.Context, path string) ([]byte, error) {
 	if c.APIKey == "" {
 		return nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
@@ -212,6 +262,19 @@ func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, 
 	}
 	if opts.Clean {
 		fields = append(fields, formField{name: "no_verbatim", value: "true"})
+	}
+	if opts.Webhook {
+		fields = append(fields, formField{name: "webhook", value: "true"})
+	}
+	if opts.WebhookID != "" {
+		fields = append(fields, formField{name: "webhook_id", value: opts.WebhookID})
+	}
+	if len(opts.WebhookMetadata) > 0 {
+		metadata, err := json.Marshal(opts.WebhookMetadata)
+		if err != nil {
+			return apperr.Wrap(apperr.CodeInvalidInput, "could not encode webhook metadata", err)
+		}
+		fields = append(fields, formField{name: "webhook_metadata", value: string(metadata)})
 	}
 	for _, field := range fields {
 		if err := writer.WriteField(field.name, field.value); err != nil {

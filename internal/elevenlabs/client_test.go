@@ -156,6 +156,105 @@ func TestGetDeleteAndRawGET(t *testing.T) {
 	}
 }
 
+func TestGetUserParsesStableIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/user" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("xi-api-key") != "test-key" {
+			t.Fatalf("missing API key")
+		}
+		_, _ = w.Write([]byte(`{"user_id":"user_123","seat_type":"workspace_admin","created_at":1689761411,"xi_api_key":"secret"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	client.HTTPClient = server.Client()
+
+	user, raw, err := client.GetUser(context.Background())
+	if err != nil {
+		t.Fatalf("GetUser() error = %v", err)
+	}
+	if user.UserID != "user_123" || user.SeatType != "workspace_admin" || user.CreatedAt != 1689761411 {
+		t.Fatalf("user = %+v", user)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("raw response is not JSON: %q", string(raw))
+	}
+}
+
+func TestSubmitTranscriptionWebhookSendsMetadata(t *testing.T) {
+	audio := t.TempDir() + "/episode.mp3"
+	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var fields map[string][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		fields = map[string][]string{}
+		var sawFile bool
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("ReadAll(part) error = %v", err)
+			}
+			if part.FormName() == "file" {
+				sawFile = true
+				continue
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(b))
+		}
+		if !sawFile {
+			t.Fatal("multipart request did not include file")
+		}
+		_, _ = w.Write([]byte(`{"message":"Request accepted. Transcription result will be sent to the webhook.","request_id":"req_123","transcription_id":"tx_123"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	client.HTTPClient = server.Client()
+
+	resp, _, err := client.SubmitTranscriptionWebhook(context.Background(), TranscribeOptions{
+		FilePath:              audio,
+		Model:                 "scribe_v2",
+		TagAudioEvents:        true,
+		TimestampsGranularity: "word",
+		WebhookID:             "wh_123",
+		WebhookMetadata: map[string]any{
+			"podscribe_job_key": "job_123",
+		},
+	})
+	if err != nil {
+		t.Fatalf("SubmitTranscriptionWebhook() error = %v", err)
+	}
+	if resp.RequestID != "req_123" || resp.TranscriptionID == nil || *resp.TranscriptionID != "tx_123" {
+		t.Fatalf("webhook response = %+v", resp)
+	}
+	assertField(t, fields, "webhook", "true")
+	assertField(t, fields, "webhook_id", "wh_123")
+	var metadata map[string]string
+	if err := json.Unmarshal([]byte(fields["webhook_metadata"][0]), &metadata); err != nil {
+		t.Fatalf("webhook_metadata is not JSON: %v", err)
+	}
+	if metadata["podscribe_job_key"] != "job_123" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
 func TestRawGetRejectsAbsoluteURL(t *testing.T) {
 	client := NewClient("https://api.example", "test-key")
 	if _, err := client.RawGet(context.Background(), "https://evil.example/v1/models"); err == nil {

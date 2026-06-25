@@ -43,6 +43,8 @@ By default, `podscribe` writes `episode.transcript.md` next to the audio file an
 
 Human-readable runs print upload progress to stderr, then keep reporting that the command is waiting for the ElevenLabs transcript response if server-side processing takes a while.
 
+Completed transcription results are cached in `~/.podscribe/jobs/v1` and automatically reused for identical audio, ElevenLabs user, base URL, and remote transcription options. Local-only options such as `--out`, `--raw-out`, `--timestamps`, and `--speaker-name` can re-render from the cached raw transcript without a new ElevenLabs request. Pass `--force` to bypass the cache and submit a new request.
+
 Pass `--timestamps` to prefix transcript blocks with `[hh:mm:ss]` timestamps.
 
 Useful podcast flags:
@@ -70,6 +72,20 @@ Save the raw ElevenLabs JSON alongside the Markdown:
 
 ```bash
 podscribe transcribe episode.mp3 --raw-out episode.elevenlabs.json
+```
+
+Submit asynchronously to a configured ElevenLabs speech-to-text webhook:
+
+```bash
+podscribe transcribe episode.mp3 --webhook --webhook-id <webhook-id>
+```
+
+When the webhook payload arrives, import it into the local cache and optionally render outputs:
+
+```bash
+podscribe transcripts import-webhook payload.json \
+  --out episode.transcript.md \
+  --raw-out episode.elevenlabs.json
 ```
 
 Fetch or delete stored transcripts:
