@@ -30,7 +30,7 @@
             inherit version;
 
             src = ./.;
-            vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            vendorHash = "sha256-hpAsYPhiYnTpY5Z7QZz9cr5RtleHnR1ezgoVaQ+cvp0=";
 
             subPackages = [ "cmd/podscribe" ];
             ldflags = [
@@ -59,12 +59,39 @@
           app = {
             type = "app";
             program = "${podscribe}/bin/podscribe";
+            meta.description = "Transcribe podcast audio with the ElevenLabs Speech to Text API";
           };
         in
         {
-          inherit app;
           podscribe = app;
           default = app;
+        }
+      );
+
+      checks = forAllSystems (
+        system:
+        let
+          podscribe = self.packages.${system}.podscribe;
+        in
+        {
+          inherit podscribe;
+          default = podscribe;
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.go
+              pkgs.goreleaser
+              pkgs.nixfmt
+            ];
+          };
         }
       );
     };
