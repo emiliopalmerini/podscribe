@@ -4,9 +4,20 @@
 
 ## Install
 
+With Go:
+
 ```bash
 go install github.com/emiliopalmerini/podscribe/cmd/podscribe@latest
 ```
+
+With Nix:
+
+```bash
+nix run github:emiliopalmerini/podscribe -- doctor
+nix profile install github:emiliopalmerini/podscribe
+```
+
+Prebuilt release archives for macOS, Linux, and Windows are published from tagged GitHub releases. Download the archive for your platform from the releases page and verify it with the published SHA-256 checksum file.
 
 ## Configure
 
@@ -163,3 +174,22 @@ go build ./cmd/podscribe
 ```
 
 No live ElevenLabs calls run in CI. Use `podscribe doctor` and a small local audio file for manual smoke testing.
+
+## Release
+
+Releases are tag-driven. To publish a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow runs tests, `go vet`, builds cross-platform archives with GoReleaser, stamps the CLI version from the tag, and publishes SHA-256 checksums.
+
+Before pushing a tag, validate release packaging locally:
+
+```bash
+goreleaser check
+goreleaser release --snapshot --clean
+nix flake check
+```
