@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -20,10 +22,18 @@ import (
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 )
 
+const (
+	defaultRetryAttempts  = 3
+	defaultRetryBaseDelay = 200 * time.Millisecond
+	defaultRetryMaxDelay  = 2 * time.Second
+)
+
 type Client struct {
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	BaseURL        string
+	APIKey         string
+	HTTPClient     *http.Client
+	retryAttempts  int
+	retryBaseDelay time.Duration
 }
 
 type TranscribeOptions struct {
@@ -56,6 +66,8 @@ func NewClient(baseURL, apiKey string) *Client {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Minute,
 		},
+		retryAttempts:  defaultRetryAttempts,
+		retryBaseDelay: defaultRetryBaseDelay,
 	}
 }
 
@@ -68,41 +80,9 @@ func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (Tr
 		return TranscriptResponse{}, nil, err
 	}
 
-	file, err := os.Open(opts.FilePath)
-	if err != nil {
-		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not open audio file %s", opts.FilePath), err)
-	}
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
-		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", opts.FilePath), err)
-	}
-
-	pr, pw := io.Pipe()
-	writer := multipart.NewWriter(pw)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
-	if err != nil {
-		_ = file.Close()
-		_ = pw.CloseWithError(err)
-		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build transcription request", err)
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("xi-api-key", c.APIKey)
-
-	go func() {
-		defer file.Close()
-		if err := writeTranscribeMultipart(writer, opts, file, info.Size()); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		if err := writer.Close(); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
-
-	raw, err := c.do(req)
+	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newTranscribeRequest(ctx, endpoint, opts)
+	})
 	if err != nil {
 		return TranscriptResponse{}, nil, err
 	}
@@ -113,6 +93,44 @@ func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (Tr
 	return transcript, raw, nil
 }
 
+func (c *Client) newTranscribeRequest(ctx context.Context, endpoint string, opts TranscribeOptions) (*http.Request, error) {
+	file, err := os.Open(opts.FilePath)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not open audio file %s", opts.FilePath), err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", opts.FilePath), err)
+	}
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
+	if err != nil {
+		file.Close()
+		pw.CloseWithError(err)
+		return nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build transcription request", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("xi-api-key", c.APIKey)
+
+	go func() {
+		defer file.Close()
+		if err := writeTranscribeMultipart(writer, opts, file, info.Size()); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	return req, nil
+}
+
 func (c *Client) GetTranscript(ctx context.Context, id string) (TranscriptResponse, []byte, error) {
 	if c.APIKey == "" {
 		return TranscriptResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
@@ -121,13 +139,9 @@ func (c *Client) GetTranscript(ctx context.Context, id string) (TranscriptRespon
 	if err != nil {
 		return TranscriptResponse{}, nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build get transcript request", err)
-	}
-	req.Header.Set("xi-api-key", c.APIKey)
-
-	raw, err := c.do(req)
+	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newAPIRequest(ctx, http.MethodGet, endpoint, "could not build get transcript request")
+	})
 	if err != nil {
 		return TranscriptResponse{}, nil, err
 	}
@@ -146,12 +160,9 @@ func (c *Client) DeleteTranscript(ctx context.Context, id string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
-	if err != nil {
-		return nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build delete transcript request", err)
-	}
-	req.Header.Set("xi-api-key", c.APIKey)
-	return c.do(req)
+	return c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newAPIRequest(ctx, http.MethodDelete, endpoint, "could not build delete transcript request")
+	})
 }
 
 func (c *Client) RawGet(ctx context.Context, path string) ([]byte, error) {
@@ -168,12 +179,18 @@ func (c *Client) RawGet(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	return c.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return c.newAPIRequest(ctx, http.MethodGet, endpoint, "could not build raw GET request")
+	})
+}
+
+func (c *Client) newAPIRequest(ctx context.Context, method, endpoint, buildError string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
-		return nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build raw GET request", err)
+		return nil, apperr.Wrap(apperr.CodeInvalidInput, buildError, err)
 	}
 	req.Header.Set("xi-api-key", c.APIKey)
-	return c.do(req)
+	return req, nil
 }
 
 func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, file *os.File, totalBytes int64) error {
@@ -268,25 +285,96 @@ func (c *Client) endpoint(path string) (string, error) {
 	return strings.TrimRight(c.BaseURL, "/") + path, nil
 }
 
-func (c *Client) do(req *http.Request) ([]byte, error) {
+func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*http.Request, error)) ([]byte, error) {
 	httpClient := c.HTTPClient
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	res, err := httpClient.Do(req)
-	if err != nil {
-		return nil, apperr.Wrap(apperr.CodeNetwork, "request to ElevenLabs failed", err)
-	}
-	defer res.Body.Close()
+	attempts := c.attempts()
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, err := buildRequest(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := httpClient.Do(req)
+		if err != nil {
+			if !isRetryableConnectionError(err) || ctx.Err() != nil || attempt == attempts {
+				return nil, apperr.Wrap(apperr.CodeNetwork, "request to ElevenLabs failed", err)
+			}
+			if err := sleepContext(ctx, c.retryDelay(attempt)); err != nil {
+				return nil, apperr.Wrap(apperr.CodeNetwork, "request to ElevenLabs failed", err)
+			}
+			continue
+		}
+		defer res.Body.Close()
 
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, apperr.Wrap(apperr.CodeNetwork, "could not read ElevenLabs response", err)
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, apperr.Wrap(apperr.CodeNetwork, "could not read ElevenLabs response", err)
+		}
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			return nil, newAPIError(res, body)
+		}
+		return body, nil
 	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, newAPIError(res, body)
+	return nil, apperr.New(apperr.CodeNetwork, "request to ElevenLabs failed")
+}
+
+func (c *Client) attempts() int {
+	if c.retryAttempts > 0 {
+		return c.retryAttempts
 	}
-	return body, nil
+	return defaultRetryAttempts
+}
+
+func (c *Client) retryDelay(attempt int) time.Duration {
+	if c.retryBaseDelay <= 0 {
+		return 0
+	}
+	delay := c.retryBaseDelay
+	for i := 1; i < attempt; i++ {
+		if delay >= defaultRetryMaxDelay/2 {
+			return defaultRetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > defaultRetryMaxDelay {
+		return defaultRetryMaxDelay
+	}
+	return delay
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func isRetryableConnectionError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func compactBody(body []byte) string {

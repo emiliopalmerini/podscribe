@@ -3,7 +3,10 @@ package elevenlabs
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -160,6 +163,119 @@ func TestRawGetRejectsAbsoluteURL(t *testing.T) {
 	}
 }
 
+func TestRawGetRetriesConnectionErrors(t *testing.T) {
+	var attempts int
+	client := NewClient("https://api.example", "test-key")
+	client.retryBaseDelay = 0
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, retryableDialError()
+		}
+		if req.Method != http.MethodGet || req.URL.Path != "/v1/models" {
+			t.Fatalf("request = %s %s", req.Method, req.URL.Path)
+		}
+		return jsonResponse(req, http.StatusOK, `{"models":[]}`), nil
+	})}
+
+	raw, err := client.RawGet(context.Background(), "/v1/models")
+	if err != nil {
+		t.Fatalf("RawGet() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("raw response is not JSON: %q", string(raw))
+	}
+}
+
+func TestRawGetDoesNotRetryAPIErrors(t *testing.T) {
+	var attempts int
+	client := NewClient("https://api.example", "test-key")
+	client.retryBaseDelay = 0
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		return jsonResponse(req, http.StatusInternalServerError, `{"detail":"temporary upstream failure"}`), nil
+	})}
+
+	_, err := client.RawGet(context.Background(), "/v1/models")
+	if err == nil {
+		t.Fatal("RawGet() error = nil, want API error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if got := apperr.Code(err); got != apperr.CodeAPI {
+		t.Fatalf("error code = %q, want %q", got, apperr.CodeAPI)
+	}
+}
+
+func TestTranscribeFileRetriesConnectionErrorsWithFreshMultipartRequest(t *testing.T) {
+	audio := t.TempDir() + "/episode.mp3"
+	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var attempts int
+	client := NewClient("https://api.example", "test-key")
+	client.retryBaseDelay = 0
+	client.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			_ = req.Body.Close()
+			return nil, retryableDialError()
+		}
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", req.Method, req.URL.Path)
+		}
+		reader, err := req.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		var fileContent string
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("ReadAll(part) error = %v", err)
+			}
+			if part.FormName() == "file" {
+				fileContent = string(b)
+			}
+		}
+		if fileContent != "fake audio" {
+			t.Fatalf("file content = %q", fileContent)
+		}
+		return jsonResponse(req, http.StatusOK, `{"language_code":"en","text":"Hello","words":[],"transcription_id":"tx_123"}`), nil
+	})}
+
+	resp, raw, err := client.TranscribeFile(context.Background(), TranscribeOptions{
+		FilePath:              audio,
+		Model:                 "scribe_v2",
+		TagAudioEvents:        true,
+		TimestampsGranularity: "word",
+	})
+	if err != nil {
+		t.Fatalf("TranscribeFile() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if resp.TranscriptionID != "tx_123" {
+		t.Fatalf("transcription ID = %q", resp.TranscriptionID)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("raw response is not JSON: %q", string(raw))
+	}
+}
+
 func TestAPIErrorIncludesStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"detail":"bad request"}`, http.StatusBadRequest)
@@ -309,4 +425,24 @@ func assertField(t *testing.T, fields map[string][]string, name, want string) {
 
 func osWriteFile(name string, data []byte) error {
 	return os.WriteFile(name, data, 0o644)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func retryableDialError() error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+}
+
+func jsonResponse(req *http.Request, statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
 }
