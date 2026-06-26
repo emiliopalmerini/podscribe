@@ -44,6 +44,64 @@ func TestDoctorJSONWithoutAuth(t *testing.T) {
 	}
 }
 
+func TestVersionFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"--version"},
+		{"-v"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			err := Execute(context.Background(), args, strings.NewReader(""), &stdout, &stderr, "test")
+			if err != nil {
+				t.Fatalf("Execute() error = %v\nstderr=%s", err, stderr.String())
+			}
+			if got, want := stdout.String(), "podscribe test\n"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+		})
+	}
+}
+
+func TestVersionFlagHonorsJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{"--json", "--version"}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstderr=%s", err, stderr.String())
+	}
+	var env struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Version string `json:"version"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if !env.OK || env.Data.Version != "test" {
+		t.Fatalf("version JSON = %+v", env)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestHelpIncludesVersionFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{"--help"}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "-v, --version") {
+		t.Fatalf("stdout = %q, want version flags", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestDefaultTranscriptPath(t *testing.T) {
 	got := defaultTranscriptPath("/tmp/audio/episode.final.mp3")
 	want := "/tmp/audio/episode.final.transcript.md"

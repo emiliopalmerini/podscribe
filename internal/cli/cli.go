@@ -35,6 +35,9 @@ type rootOptions struct {
 
 func Execute(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer, version string) error {
 	opts := &rootOptions{version: version, in: in, out: out, errOut: errOut}
+	if rootBoolFlag(args, "version", "v") && rootBoolFlag(args, "json", "") {
+		return output.JSONSuccess(out, map[string]any{"version": version})
+	}
 	cmd := newRootCommand(ctx, opts)
 	cmd.SetArgs(args)
 	cmd.SetIn(in)
@@ -57,9 +60,11 @@ func newRootCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "podscribe",
 		Short:         "Transcribe podcast audio with ElevenLabs",
+		Version:       opts.version,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
+	cmd.SetVersionTemplate("podscribe {{.Version}}\n")
 	cmd.PersistentFlags().BoolVar(&opts.json, "json", false, "emit machine-readable JSON on stdout")
 	cmd.PersistentFlags().StringVar(&opts.apiKey, "api-key", "", "ElevenLabs API key for this invocation")
 	cmd.PersistentFlags().StringVar(&opts.baseURL, "base-url", "", "ElevenLabs API base URL")
@@ -70,6 +75,35 @@ func newRootCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 	cmd.AddCommand(newTranscriptsCommand(ctx, opts))
 	cmd.AddCommand(newRequestCommand(ctx, opts))
 	return cmd
+}
+
+func rootBoolFlag(args []string, name, shorthand string) bool {
+	longFlag := "--" + name
+	longPrefix := longFlag + "="
+	shortFlag := ""
+	if shorthand != "" {
+		shortFlag = "-" + shorthand
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			return false
+		}
+		if arg == longFlag || (shortFlag != "" && arg == shortFlag) {
+			return true
+		}
+		if strings.HasPrefix(arg, longPrefix) {
+			return strings.TrimPrefix(arg, longPrefix) == "true"
+		}
+		switch arg {
+		case "--api-key", "--base-url":
+			i++
+		}
+	}
+	return false
 }
 
 func newInitCommand(opts *rootOptions) *cobra.Command {
