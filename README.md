@@ -167,13 +167,28 @@ Speaker labels are emitted when diarization is requested or speaker IDs are pres
 
 ## Development
 
+Use the Nix development shell for pinned local tooling:
+
 ```bash
-go test ./...
-go vet ./...
-go build ./cmd/podscribe
+nix develop
 ```
 
+Or use the local Go toolchain directly:
+
+```bash
+make build
+make test
+make vet
+make check
+```
+
+`make check` formats Go files, runs `go vet`, and runs the full test suite. `nix flake check` validates the Nix package/check output.
+
 No live ElevenLabs calls run in CI. Use `podscribe doctor` and a small local audio file for manual smoke testing.
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) for the repository layout, local workflow, testing expectations, JSON/stdout rules, and security guidance before opening a PR.
 
 ## Release
 
