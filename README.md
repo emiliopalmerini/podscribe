@@ -106,6 +106,17 @@ podscribe transcripts get <transcription-id> --out transcript.json
 podscribe transcripts delete <transcription-id> --yes
 ```
 
+Locate selected transcript text in the cached word timings:
+
+```bash
+podscribe transcripts locate episode.transcript.md --text "Welcome back"
+cat selected.txt | podscribe transcripts locate episode.mp3 --text -
+podscribe transcripts locate episode.mp3 --text "Welcome back" --clip-out welcome.mp3
+```
+
+The lookup is local and uses completed jobs in `~/.podscribe/jobs/v1`; pass `--job-key` if a path matches more than one cached job.
+`--clip-out` writes a single matched audio segment with `ffmpeg -c copy`; install `ffmpeg` and pass `--limit 1` or narrow the selected text if the lookup returns multiple matches. Existing clip files are not overwritten unless `--force` is set.
+
 Run a read-only raw API request:
 
 ```bash

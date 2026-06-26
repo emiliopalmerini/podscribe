@@ -114,3 +114,73 @@ func TestSaveWritesPrivateCacheFile(t *testing.T) {
 		t.Fatalf("cache dir permissions = %o, want 0700", got)
 	}
 }
+
+func TestFindCompletedByPathMatchesStoredPaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	out := filepath.Join(dir, "episode.transcript.md")
+	raw := filepath.Join(dir, "episode.json")
+
+	if _, err := Save(Record{
+		JobKey:        "completed",
+		Status:        StatusCompleted,
+		SourcePath:    audio,
+		OutputPath:    out,
+		RawOutputPath: raw,
+	}); err != nil {
+		t.Fatalf("Save(completed) error = %v", err)
+	}
+	if _, err := Save(Record{
+		JobKey:     "pending",
+		Status:     StatusPending,
+		SourcePath: audio,
+	}); err != nil {
+		t.Fatalf("Save(pending) error = %v", err)
+	}
+
+	for _, path := range []string{audio, out, raw} {
+		matches, err := FindCompletedByPath(path)
+		if err != nil {
+			t.Fatalf("FindCompletedByPath(%q) error = %v", path, err)
+		}
+		if len(matches) != 1 || matches[0].Record.JobKey != "completed" {
+			t.Fatalf("FindCompletedByPath(%q) = %+v, want completed record", path, matches)
+		}
+	}
+}
+
+func TestFindCompletedByPathMatchesRelativeAndAbsolutePaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%q) error = %v", dir, err)
+	}
+	defer func() {
+		if err := os.Chdir(previousDir); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	}()
+
+	if _, err := Save(Record{
+		JobKey:     "relative",
+		Status:     StatusCompleted,
+		OutputPath: "episode.transcript.md",
+	}); err != nil {
+		t.Fatalf("Save(relative) error = %v", err)
+	}
+
+	matches, err := FindCompletedByPath(filepath.Join(dir, "episode.transcript.md"))
+	if err != nil {
+		t.Fatalf("FindCompletedByPath() error = %v", err)
+	}
+	if len(matches) != 1 || matches[0].Record.JobKey != "relative" {
+		t.Fatalf("FindCompletedByPath() = %+v, want relative record", matches)
+	}
+}

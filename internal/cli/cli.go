@@ -14,9 +14,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
+	"github.com/emiliopalmerini/podscribe/internal/audioclip"
 	"github.com/emiliopalmerini/podscribe/internal/config"
 	"github.com/emiliopalmerini/podscribe/internal/elevenlabs"
 	"github.com/emiliopalmerini/podscribe/internal/jobstore"
+	"github.com/emiliopalmerini/podscribe/internal/locate"
 	"github.com/emiliopalmerini/podscribe/internal/output"
 	"github.com/emiliopalmerini/podscribe/internal/render"
 )
@@ -593,6 +595,7 @@ func newTranscriptsCommand(ctx context.Context, opts *rootOptions) *cobra.Comman
 	}
 	cmd.AddCommand(newTranscriptGetCommand(ctx, opts))
 	cmd.AddCommand(newTranscriptDeleteCommand(ctx, opts))
+	cmd.AddCommand(newTranscriptLocateCommand(opts))
 	cmd.AddCommand(newTranscriptImportWebhookCommand(opts))
 	return cmd
 }
@@ -686,6 +689,182 @@ func newTranscriptDeleteCommand(ctx context.Context, opts *rootOptions) *cobra.C
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "confirm deletion")
 	return cmd
+}
+
+func newTranscriptLocateCommand(opts *rootOptions) *cobra.Command {
+	var text string
+	var jobKey string
+	var clipOut string
+	var force bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "locate <audio-or-transcript-file>",
+		Short: "Find the audio timestamp for selected transcript text",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+				return apperr.New(apperr.CodeInvalidInput, "provide an audio or transcript path")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit <= 0 {
+				return apperr.New(apperr.CodeInvalidInput, "--limit must be greater than 0")
+			}
+			query, err := readLocateText(opts.in, text)
+			if err != nil {
+				return err
+			}
+			entry, err := resolveLocateRecord(args[0], jobKey)
+			if err != nil {
+				return err
+			}
+			transcript, _, err := transcriptFromRaw(entry.Record.RawResponse, entry.Path)
+			if err != nil {
+				return err
+			}
+			result := locate.Find(transcript, query, limit)
+			if !result.HasTimedWords {
+				return apperr.New(apperr.CodeNotFound, fmt.Sprintf("cached transcript for job %s does not include word-level timing", entry.Record.JobKey))
+			}
+			if len(result.Matches) == 0 {
+				return apperr.New(apperr.CodeNotFound, "could not locate selected text in cached transcript")
+			}
+			clip, err := writeLocateClip(entry.Record, result.Matches, clipOut, force)
+			if err != nil {
+				return err
+			}
+
+			data := map[string]any{
+				"job_key":         entry.Record.JobKey,
+				"cache_path":      entry.Path,
+				"source_path":     optionalString(entry.Record.SourcePath),
+				"output_path":     optionalString(entry.Record.OutputPath),
+				"raw_output_path": optionalString(entry.Record.RawOutputPath),
+				"query":           query,
+				"matches":         result.Matches,
+			}
+			if clip != nil {
+				data["clip"] = clip
+			}
+			if opts.json {
+				return output.JSONSuccess(opts.out, data)
+			}
+			writeLocateHuman(opts.out, entry.Record, result.Matches, clip)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&text, "text", "", "selected transcript text to locate; use - to read stdin")
+	cmd.Flags().StringVar(&jobKey, "job-key", "", "explicit local job key when path matching is ambiguous")
+	cmd.Flags().StringVar(&clipOut, "clip-out", "", "write the matched audio segment to this path using ffmpeg stream copy")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing --clip-out file")
+	cmd.Flags().IntVar(&limit, "limit", locate.DefaultLimit, "maximum number of matches to return")
+	return cmd
+}
+
+func readLocateText(in io.Reader, text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", apperr.New(apperr.CodeInvalidInput, "provide --text with selected transcript text or --text - to read stdin")
+	}
+	if text == "-" {
+		b, err := io.ReadAll(in)
+		if err != nil {
+			return "", apperr.Wrap(apperr.CodeFilesystem, "could not read selected transcript text from stdin", err)
+		}
+		text = string(b)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", apperr.New(apperr.CodeInvalidInput, "selected transcript text cannot be empty")
+	}
+	return text, nil
+}
+
+func resolveLocateRecord(path, jobKey string) (jobstore.Entry, error) {
+	jobKey = strings.TrimSpace(jobKey)
+	if jobKey != "" {
+		record, found, err := jobstore.Load(jobKey)
+		if err != nil {
+			return jobstore.Entry{}, err
+		}
+		if !found {
+			return jobstore.Entry{}, apperr.New(apperr.CodeNotFound, fmt.Sprintf("no local job cache found for job %s", jobKey))
+		}
+		cachePath, err := jobstore.Path(jobKey)
+		if err != nil {
+			return jobstore.Entry{}, err
+		}
+		if record.Status != jobstore.StatusCompleted {
+			return jobstore.Entry{}, apperr.New(apperr.CodeNotFound, fmt.Sprintf("job %s is %s, not completed", jobKey, record.Status))
+		}
+		return jobstore.Entry{Path: cachePath, Record: record}, nil
+	}
+
+	matches, err := jobstore.FindCompletedByPath(path)
+	if err != nil {
+		return jobstore.Entry{}, err
+	}
+	if len(matches) == 0 {
+		return jobstore.Entry{}, apperr.New(apperr.CodeNotFound, fmt.Sprintf("no completed cached transcript found for %s; run transcribe first or pass --job-key", path))
+	}
+	if len(matches) > 1 {
+		keys := make([]string, 0, len(matches))
+		for _, match := range matches {
+			keys = append(keys, match.Record.JobKey)
+		}
+		return jobstore.Entry{}, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("%s matches multiple completed jobs (%s); pass --job-key", path, strings.Join(keys, ", ")))
+	}
+	return matches[0], nil
+}
+
+func writeLocateClip(record jobstore.Record, matches []locate.Match, clipOut string, force bool) (*audioclip.Result, error) {
+	clipOut = strings.TrimSpace(clipOut)
+	if clipOut == "" {
+		return nil, nil
+	}
+	if len(matches) != 1 {
+		return nil, apperr.New(apperr.CodeInvalidInput, "--clip-out requires exactly one located match; narrow the selection or pass --limit 1")
+	}
+	if strings.TrimSpace(record.SourcePath) == "" {
+		return nil, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("cached job %s does not include a source audio path; cannot use --clip-out", record.JobKey))
+	}
+	match := matches[0]
+	clip, err := audioclip.Copy(audioclip.Request{
+		SourcePath:   record.SourcePath,
+		OutputPath:   clipOut,
+		StartSeconds: match.StartSeconds,
+		EndSeconds:   match.EndSeconds,
+		Force:        force,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &clip, nil
+}
+
+func writeLocateHuman(w io.Writer, record jobstore.Record, matches []locate.Match, clip *audioclip.Result) {
+	audioPath := firstNonEmptyString(record.SourcePath, record.OutputPath, record.RawOutputPath)
+	if len(matches) == 1 {
+		match := matches[0]
+		fmt.Fprintf(w, "Timestamp: %s (%.3fs)\n", match.Timestamp, match.StartSeconds)
+		fmt.Fprintf(w, "Audio: %s\n", audioPath)
+		if clip != nil {
+			fmt.Fprintf(w, "Clip: %s\n", clip.OutputPath)
+		}
+		fmt.Fprintf(w, "Match: %s\n", match.Text)
+		if match.Context != "" {
+			fmt.Fprintf(w, "Context: %s\n", match.Context)
+		}
+		return
+	}
+
+	fmt.Fprintf(w, "Audio: %s\n", audioPath)
+	fmt.Fprintf(w, "Matches: %d\n", len(matches))
+	for i, match := range matches {
+		fmt.Fprintf(w, "%d. %s (%.3fs) %s\n", i+1, match.Timestamp, match.StartSeconds, match.Text)
+		if match.Context != "" {
+			fmt.Fprintf(w, "   Context: %s\n", match.Context)
+		}
+	}
 }
 
 func newTranscriptImportWebhookCommand(opts *rootOptions) *cobra.Command {

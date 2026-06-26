@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/emiliopalmerini/podscribe/internal/jobstore"
 )
 
 func TestDoctorJSONWithoutAuth(t *testing.T) {
@@ -579,6 +581,348 @@ func TestImportWebhookCompletesJobCache(t *testing.T) {
 	}
 }
 
+func TestTranscriptLocateFindsSelectedTextFromCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	outPath := filepath.Join(dir, "episode.transcript.md")
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-json",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		OutputPath: outPath,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Before Hello world after.",
+			"words":[
+				{"text":"Before","start":1.0,"end":1.1,"type":"word"},
+				{"text":"Hello","start":1.2,"end":1.4,"type":"word"},
+				{"text":"world.","start":1.5,"end":1.8,"type":"word"},
+				{"text":"after.","start":2.0,"end":2.2,"type":"word"}
+			],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--json",
+		"transcripts", "locate", outPath,
+		"--text", "[00:00:01] Speaker 1: hello world",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	var env struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			JobKey     string `json:"job_key"`
+			SourcePath string `json:"source_path"`
+			Matches    []struct {
+				StartSeconds float64 `json:"start_seconds"`
+				EndSeconds   float64 `json:"end_seconds"`
+				Timestamp    string  `json:"timestamp"`
+				Text         string  `json:"text"`
+				Context      string  `json:"context"`
+			} `json:"matches"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if !env.OK || env.Data.JobKey != "locate-json" || env.Data.SourcePath != audio {
+		t.Fatalf("locate JSON = %+v", env)
+	}
+	if len(env.Data.Matches) != 1 {
+		t.Fatalf("matches = %+v, want 1", env.Data.Matches)
+	}
+	match := env.Data.Matches[0]
+	if match.Timestamp != "00:00:01.200" || match.StartSeconds != 1.2 || match.EndSeconds != 1.8 {
+		t.Fatalf("match timing = %+v, want 1.2-1.8", match)
+	}
+	if match.Text != "Hello world." || !strings.Contains(match.Context, "Before Hello world. after.") {
+		t.Fatalf("match text/context = %+v", match)
+	}
+}
+
+func TestTranscriptLocateReadsSelectedTextFromStdin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-stdin",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Hello world.",
+			"words":[
+				{"text":"Hello","start":1.2,"end":1.4,"type":"word"},
+				{"text":"world.","start":1.5,"end":1.8,"type":"word"}
+			],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcripts", "locate", audio,
+		"--text", "-",
+	}, strings.NewReader("Speaker 1: Hello world"), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"Timestamp: 00:00:01.200 (1.200s)",
+		"Audio: " + audio,
+		"Match: Hello world.",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestTranscriptLocateRequiresJobKeyForAmbiguousCacheMatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	sharedOut := filepath.Join(dir, "episode.transcript.md")
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-a",
+		Status:     jobstore.StatusCompleted,
+		OutputPath: sharedOut,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"First phrase.",
+			"words":[{"text":"First","start":1.0,"end":1.1,"type":"word"}],
+			"transcription_id":"tx_a"
+		}`),
+	})
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-b",
+		Status:     jobstore.StatusCompleted,
+		OutputPath: sharedOut,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Second phrase.",
+			"words":[{"text":"Second","start":2.0,"end":2.1,"type":"word"}],
+			"transcription_id":"tx_b"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcripts", "locate", sharedOut,
+		"--text", "Second",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want ambiguous cache error")
+	}
+	if !strings.Contains(stderr.String(), "matches multiple completed jobs (locate-a, locate-b)") {
+		t.Fatalf("stderr = %q, want ambiguous cache guidance", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err = Execute(context.Background(), []string{
+		"transcripts", "locate", sharedOut,
+		"--job-key", "locate-b",
+		"--text", "Second",
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute(--job-key) error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Timestamp: 00:00:02.000 (2.000s)") {
+		t.Fatalf("stdout = %q, want locate-b timestamp", stdout.String())
+	}
+}
+
+func TestTranscriptLocateWritesClipOut(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	installFakeFFmpegForCLITest(t, dir)
+	audio := filepath.Join(dir, "episode.mp3")
+	clipOut := filepath.Join(dir, "clip.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-clip",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Hello world.",
+			"words":[
+				{"text":"Hello","start":1.2,"end":1.4,"type":"word"},
+				{"text":"world.","start":1.5,"end":1.8,"type":"word"}
+			],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--json",
+		"transcripts", "locate", audio,
+		"--text", "Hello world",
+		"--clip-out", clipOut,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if b, err := os.ReadFile(clipOut); err != nil || string(b) != "clip" {
+		t.Fatalf("clip content = %q, err=%v", string(b), err)
+	}
+
+	var env struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Clip *struct {
+				SourcePath      string  `json:"source_path"`
+				OutputPath      string  `json:"output_path"`
+				StartSeconds    float64 `json:"start_seconds"`
+				EndSeconds      float64 `json:"end_seconds"`
+				DurationSeconds float64 `json:"duration_seconds"`
+				StreamCopy      bool    `json:"stream_copy"`
+			} `json:"clip"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if !env.OK || env.Data.Clip == nil {
+		t.Fatalf("locate JSON = %+v, want clip metadata", env)
+	}
+	if env.Data.Clip.SourcePath != audio || env.Data.Clip.OutputPath != clipOut {
+		t.Fatalf("clip paths = %+v, want source/output paths", env.Data.Clip)
+	}
+	if env.Data.Clip.StartSeconds != 1.2 || env.Data.Clip.EndSeconds != 1.8 || !env.Data.Clip.StreamCopy {
+		t.Fatalf("clip metadata = %+v", env.Data.Clip)
+	}
+}
+
+func TestTranscriptLocateClipOutRequiresSingleReturnedMatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "episode.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-many",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"again again.",
+			"words":[
+				{"text":"again","start":1.0,"end":1.1,"type":"word"},
+				{"text":"again","start":2.0,"end":2.1,"type":"word"}
+			],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcripts", "locate", audio,
+		"--text", "again",
+		"--clip-out", filepath.Join(dir, "clip.mp3"),
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want multiple-match clip error")
+	}
+	if !strings.Contains(stderr.String(), "--clip-out requires exactly one located match") {
+		t.Fatalf("stderr = %q, want single-match guidance", stderr.String())
+	}
+}
+
+func TestTranscriptLocateClipOutRequiresForceToOverwrite(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	installFakeFFmpegForCLITest(t, dir)
+	audio := filepath.Join(dir, "episode.mp3")
+	clipOut := filepath.Join(dir, "clip.mp3")
+	if err := os.WriteFile(audio, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := os.WriteFile(clipOut, []byte("existing"), 0o644); err != nil {
+		t.Fatalf("write existing clip: %v", err)
+	}
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-overwrite",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Hello.",
+			"words":[{"text":"Hello","start":1.0,"end":1.1,"type":"word"}],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcripts", "locate", audio,
+		"--text", "Hello",
+		"--clip-out", clipOut,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want overwrite error")
+	}
+	if !strings.Contains(stderr.String(), "use --force to overwrite") {
+		t.Fatalf("stderr = %q, want overwrite guidance", stderr.String())
+	}
+}
+
+func TestTranscriptLocateClipOutRequiresExistingSourceAudio(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "missing.mp3")
+	saveLocateRecord(t, jobstore.Record{
+		JobKey:     "locate-missing-audio",
+		Status:     jobstore.StatusCompleted,
+		SourcePath: audio,
+		RawResponse: json.RawMessage(`{
+			"language_code":"en",
+			"text":"Hello.",
+			"words":[{"text":"Hello","start":1.0,"end":1.1,"type":"word"}],
+			"transcription_id":"tx_locate"
+		}`),
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"transcripts", "locate", audio,
+		"--text", "Hello",
+		"--clip-out", filepath.Join(dir, "clip.mp3"),
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want missing source audio error")
+	}
+	if !strings.Contains(stderr.String(), "could not read audio source "+audio) {
+		t.Fatalf("stderr = %q, want source audio error", stderr.String())
+	}
+}
+
 func TestTranscribeRejectsMoreSpeakerNamesThanExplicitSpeakers(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ELEVENLABS_API_KEY", "")
@@ -604,6 +948,29 @@ func TestTranscribeRejectsMoreSpeakerNamesThanExplicitSpeakers(t *testing.T) {
 	if !strings.Contains(stderr.String(), "--speakers must be at least the number of speaker names") {
 		t.Fatalf("stderr = %q, want speaker count validation error", stderr.String())
 	}
+}
+
+func saveLocateRecord(t *testing.T, record jobstore.Record) {
+	t.Helper()
+	if _, err := jobstore.Save(record); err != nil {
+		t.Fatalf("Save(%s) error = %v", record.JobKey, err)
+	}
+}
+
+func installFakeFFmpegForCLITest(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+last=
+for arg do
+  last="$arg"
+done
+printf clip > "$last"
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("PATH", dir)
 }
 
 func newTranscribeTestServer(t *testing.T) *httptest.Server {

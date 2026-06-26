@@ -67,6 +67,11 @@ type Record struct {
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
 }
 
+type Entry struct {
+	Path   string
+	Record Record
+}
+
 func Root() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -103,6 +108,100 @@ func Load(jobKey string) (Record, bool, error) {
 		return Record{}, true, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not parse job cache at %s", path), err)
 	}
 	return record, true, nil
+}
+
+func List() ([]Entry, error) {
+	root, err := Root()
+	if err != nil {
+		return nil, err
+	}
+	dirEntries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not read job cache directory %s", root), err)
+	}
+
+	entries := make([]Entry, 0, len(dirEntries))
+	for _, dirEntry := range dirEntries {
+		if dirEntry.IsDir() || !strings.HasSuffix(dirEntry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(root, dirEntry.Name())
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not read job cache at %s", path), err)
+		}
+		var record Record
+		if err := json.Unmarshal(b, &record); err != nil {
+			return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not parse job cache at %s", path), err)
+		}
+		entries = append(entries, Entry{Path: path, Record: record})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Record.JobKey < entries[j].Record.JobKey
+	})
+	return entries, nil
+}
+
+func FindCompletedByPath(path string) ([]Entry, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, apperr.New(apperr.CodeInvalidInput, "path cannot be empty")
+	}
+	entries, err := List()
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]Entry, 0)
+	for _, entry := range entries {
+		if entry.Record.Status != StatusCompleted {
+			continue
+		}
+		if recordMatchesPath(entry.Record, path) {
+			matches = append(matches, entry)
+		}
+	}
+	return matches, nil
+}
+
+func recordMatchesPath(record Record, path string) bool {
+	for _, candidate := range []string{record.SourcePath, record.OutputPath, record.RawOutputPath} {
+		if samePath(candidate, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func samePath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	absA, errA := canonicalAbs(a)
+	absB, errB := canonicalAbs(b)
+	if errA == nil && errB == nil && absA == absB {
+		return true
+	}
+	return false
+}
+
+func canonicalAbs(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	dir, file := filepath.Split(absPath)
+	if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+		absPath = filepath.Join(realDir, file)
+	}
+	return filepath.Clean(absPath), nil
 }
 
 func Save(record Record) (string, error) {
