@@ -9,7 +9,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/emiliopalmerini/podscribe/internal/elevenlabs"
+	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
 const DefaultLimit = 5
@@ -38,7 +38,7 @@ var (
 	leadingSpeaker   = regexp.MustCompile(`^\s*[\p{L}\p{N}][\p{L}\p{N} ._'&-]{0,79}:\s+`)
 )
 
-func Find(resp elevenlabs.TranscriptResponse, query string, limit int) Result {
+func Find(resp transcription.Transcript, query string, limit int) Result {
 	if limit <= 0 {
 		limit = DefaultLimit
 	}
@@ -66,7 +66,7 @@ func Find(resp elevenlabs.TranscriptResponse, query string, limit int) Result {
 	return result
 }
 
-func findChunkMatches(chunk elevenlabs.TranscriptChunk, tokens []token, queryTokens []string) []Match {
+func findChunkMatches(chunk transcription.Transcript, tokens []token, queryTokens []string) []Match {
 	matches := make([]Match, 0)
 	for i := 0; i <= len(tokens)-len(queryTokens); i++ {
 		if !tokensMatch(tokens[i:i+len(queryTokens)], queryTokens) {
@@ -118,7 +118,7 @@ func tokensMatch(tokens []token, queryTokens []string) bool {
 	return true
 }
 
-func timedTokens(words []elevenlabs.Word) ([]token, bool) {
+func timedTokens(words []transcription.Word) ([]token, bool) {
 	tokens := make([]token, 0, len(words))
 	var hasTimedWords bool
 	for i, word := range words {
@@ -168,7 +168,7 @@ func normalizeTokens(s string) []string {
 	return tokens
 }
 
-func phrase(words []elevenlabs.Word, start, end int) string {
+func phrase(words []transcription.Word, start, end int) string {
 	if len(words) == 0 || start > end {
 		return ""
 	}
