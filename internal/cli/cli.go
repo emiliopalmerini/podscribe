@@ -23,6 +23,7 @@ import (
 	"github.com/emiliopalmerini/podscribe/internal/locate"
 	"github.com/emiliopalmerini/podscribe/internal/output"
 	"github.com/emiliopalmerini/podscribe/internal/render"
+	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
 type rootOptions struct {
@@ -165,7 +166,7 @@ func newDoctorCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 				data["setup"] = "Set ELEVENLABS_API_KEY or run podscribe init --api-key <key>."
 			} else {
 				client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
-				_, err := client.RawGet(ctx, "/v1/models")
+				err := client.Check(ctx)
 				if err != nil {
 					data["remote_check"] = "failed"
 					data["api_reachable"] = false
@@ -419,29 +420,18 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		return err
 	}
 
-	transcribeOpts := elevenlabs.TranscribeOptions{
-		FilePath:              uploadPath,
-		Model:                 flags.model,
-		Language:              flags.language,
-		Diarize:               diarize,
-		Speakers:              speakers,
-		Keyterms:              keyterms,
-		Clean:                 flags.clean,
-		TagAudioEvents:        !flags.noAudioEvents,
-		TimestampsGranularity: "word",
-		UseMultiChannel:       input.MultiChannel,
-	}
+	transcribeReq := buildTranscriptRequest(uploadPath, flags, keyterms, diarize, speakers, input.MultiChannel)
 	if input.MultiChannel {
-		transcribeOpts.MultichannelOutputStyle = "combined"
+		transcribeReq.MultichannelOutputStyle = "combined"
 	}
 
 	if flags.webhook {
-		transcribeOpts.WebhookID = flags.webhookID
-		transcribeOpts.WebhookMetadata = map[string]any{
+		transcribeReq.WebhookID = flags.webhookID
+		transcribeReq.WebhookMetadata = map[string]any{
 			"podscribe_job_key":           jobKey,
 			"podscribe_account_namespace": accountNamespace,
 		}
-		return submitWebhookTranscription(ctx, opts, client, transcribeOpts, record, audioSize, transcribeOutputMeta{
+		return submitWebhookTranscription(ctx, opts, client, transcribeReq, audioSize, record, transcribeOutputMeta{
 			JobKey:                 jobKey,
 			AccountNamespace:       accountNamespace,
 			AccountNamespaceSource: namespaceSource,
@@ -456,8 +446,8 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs...\n", uploadPath, formatBytes(audioSize))
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
-	transcribeOpts.OnUploadProgress = progressCallback(progress)
-	transcript, raw, err := client.TranscribeFile(ctx, transcribeOpts)
+	transcribeReq.OnUploadProgress = progressCallback(progress)
+	transcript, err := client.Transcribe(ctx, transcribeReq)
 	if progress != nil {
 		progress.Stop()
 	}
@@ -465,6 +455,10 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		if shouldRecordTranscribeFailure(err) {
 			_, _ = saveFailedJob(record, err)
 		}
+		return err
+	}
+	raw, err := transcriptJSON(transcript)
+	if err != nil {
 		return err
 	}
 
@@ -496,18 +490,33 @@ type transcribeOutputMeta struct {
 	ReusedCache            bool
 }
 
-func resolveAccountNamespace(ctx context.Context, client *elevenlabs.Client, apiKey string) (string, string, error) {
+func resolveAccountNamespace(ctx context.Context, provider transcription.Provider, apiKey string) (string, string, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return "", "", apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
 	}
-	user, _, err := client.GetUser(ctx)
+	userID, err := provider.UserID(ctx)
 	if err == nil {
-		return jobstore.UserNamespace(user.UserID), "user", nil
+		return jobstore.UserNamespace(userID), "user", nil
 	}
 	if apperr.Code(err) == apperr.CodeConfig {
 		return "", "", err
 	}
 	return jobstore.APIKeyNamespace(apiKey), "api_key_hash", nil
+}
+
+func buildTranscriptRequest(uploadPath string, flags transcribeFlags, keyterms []string, diarize bool, speakers int, multiChannel bool) transcription.Request {
+	return transcription.Request{
+		FilePath:              uploadPath,
+		Model:                 flags.model,
+		Language:              flags.language,
+		Diarize:               diarize,
+		Speakers:              speakers,
+		Keyterms:              append([]string(nil), keyterms...),
+		Clean:                 flags.clean,
+		TagAudioEvents:        !flags.noAudioEvents,
+		TimestampsGranularity: "word",
+		UseMultiChannel:       multiChannel,
+	}
 }
 
 func resolveTranscribeInput(flags transcribeFlags, audioPath string) (transcribeInput, error) {
@@ -740,14 +749,14 @@ func writeTrackMixdownMap(w io.Writer, tracks []audiomerge.Track) {
 	}
 }
 
-func submitWebhookTranscription(ctx context.Context, opts *rootOptions, client *elevenlabs.Client, transcribeOpts elevenlabs.TranscribeOptions, record jobstore.Record, audioSize int64, meta transcribeOutputMeta) error {
+func submitWebhookTranscription(ctx context.Context, opts *rootOptions, provider transcription.Provider, transcribeReq transcription.Request, audioSize int64, record jobstore.Record, meta transcribeOutputMeta) error {
 	var progress *transcribeProgressPrinter
 	if !opts.json {
-		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs webhook...\n", transcribeOpts.FilePath, formatBytes(audioSize))
+		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs webhook...\n", transcribeReq.FilePath, formatBytes(audioSize))
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
-	transcribeOpts.OnUploadProgress = progressCallback(progress)
-	response, _, err := client.SubmitTranscriptionWebhook(ctx, transcribeOpts)
+	transcribeReq.OnUploadProgress = progressCallback(progress)
+	response, err := provider.SubmitWebhook(ctx, transcribeReq)
 	if progress != nil {
 		progress.Stop()
 	}
@@ -811,18 +820,26 @@ func saveFailedJob(record jobstore.Record, err error) (string, error) {
 	return jobstore.Save(record)
 }
 
-func transcriptFromRaw(raw []byte, source string) (elevenlabs.TranscriptResponse, []byte, error) {
+func transcriptFromRaw(raw []byte, source string) (transcription.Transcript, []byte, error) {
 	if len(raw) == 0 {
-		return elevenlabs.TranscriptResponse{}, nil, apperr.New(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is missing raw response; use --force to submit a new request", source))
+		return transcription.Transcript{}, nil, apperr.New(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is missing raw response; use --force to submit a new request", source))
 	}
-	var transcript elevenlabs.TranscriptResponse
+	var transcript transcription.Transcript
 	if err := json.Unmarshal(raw, &transcript); err != nil {
-		return elevenlabs.TranscriptResponse{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is not valid ElevenLabs JSON; use --force to submit a new request", source), err)
+		return transcription.Transcript{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is not valid transcript JSON; use --force to submit a new request", source), err)
 	}
 	return transcript, append([]byte(nil), raw...), nil
 }
 
-func writeTranscriptOutputs(opts *rootOptions, flags transcribeFlags, audioPath, outPath string, transcript elevenlabs.TranscriptResponse, raw []byte, renderReq jobstore.RenderRequest, meta transcribeOutputMeta) error {
+func transcriptJSON(transcript transcription.Transcript) ([]byte, error) {
+	raw, err := json.Marshal(transcript)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeAPI, "could not encode transcript JSON", err)
+	}
+	return raw, nil
+}
+
+func writeTranscriptOutputs(opts *rootOptions, flags transcribeFlags, audioPath, outPath string, transcript transcription.Transcript, raw []byte, renderReq jobstore.RenderRequest, meta transcribeOutputMeta) error {
 	if !opts.json {
 		if meta.ReusedCache {
 			fmt.Fprintf(opts.errOut, "Reusing cached ElevenLabs transcript from %s\n", meta.CachePath)
@@ -907,8 +924,12 @@ func newTranscriptGetCommand(ctx context.Context, opts *rootOptions) *cobra.Comm
 			if err != nil {
 				return err
 			}
-			client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
-			transcript, raw, err := client.GetTranscript(ctx, args[0])
+			provider := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+			transcript, err := provider.GetTranscript(ctx, args[0])
+			if err != nil {
+				return err
+			}
+			raw, err := transcriptJSON(transcript)
 			if err != nil {
 				return err
 			}
@@ -956,8 +977,8 @@ func newTranscriptDeleteCommand(ctx context.Context, opts *rootOptions) *cobra.C
 			if err != nil {
 				return err
 			}
-			client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
-			raw, err := client.DeleteTranscript(ctx, args[0])
+			provider := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+			response, err := provider.DeleteTranscript(ctx, args[0])
 			if err != nil {
 				return err
 			}
@@ -965,11 +986,8 @@ func newTranscriptDeleteCommand(ctx context.Context, opts *rootOptions) *cobra.C
 				"transcription_id": args[0],
 				"deleted":          true,
 			}
-			if len(raw) > 0 && json.Valid(raw) {
-				var body any
-				if err := json.Unmarshal(raw, &body); err == nil {
-					data["response"] = body
-				}
+			if response != nil {
+				data["response"] = response
 			}
 			if opts.json {
 				return output.JSONSuccess(opts.out, data)
@@ -1593,14 +1611,14 @@ func newTranscribeProgressPrinter(w io.Writer) *transcribeProgressPrinter {
 	}
 }
 
-func progressCallback(progress *transcribeProgressPrinter) func(elevenlabs.UploadProgress) {
+func progressCallback(progress *transcribeProgressPrinter) func(transcription.UploadProgress) {
 	if progress == nil {
 		return nil
 	}
 	return progress.ReportUpload
 }
 
-func (p *transcribeProgressPrinter) ReportUpload(progress elevenlabs.UploadProgress) {
+func (p *transcribeProgressPrinter) ReportUpload(progress transcription.UploadProgress) {
 	if progress.SentBytes == 0 {
 		return
 	}

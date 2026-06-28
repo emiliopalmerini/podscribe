@@ -10,7 +10,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/emiliopalmerini/podscribe/internal/elevenlabs"
+	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
 type MarkdownOptions struct {
@@ -30,7 +30,7 @@ type block struct {
 	Text    string
 }
 
-func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
+func Markdown(resp transcription.Transcript, opts MarkdownOptions) string {
 	if opts.Title == "" {
 		opts.Title = strings.TrimSuffix(filepath.Base(opts.SourceFile), filepath.Ext(opts.SourceFile))
 	}
@@ -59,7 +59,7 @@ func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
-func writeFrontMatter(b *strings.Builder, resp elevenlabs.TranscriptResponse, opts MarkdownOptions) {
+func writeFrontMatter(b *strings.Builder, resp transcription.Transcript, opts MarkdownOptions) {
 	chunks := resp.Chunks()
 	first := chunks[0]
 	duration := resp.AudioDurationSecs
@@ -97,7 +97,7 @@ func yamlString(b *strings.Builder, key, value string) {
 	fmt.Fprintf(b, "%s: %s\n", key, strconv.Quote(value))
 }
 
-func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, timestamps bool, labels map[string]string) {
+func writeChunk(b *strings.Builder, chunk transcription.Transcript, diarized, timestamps bool, labels map[string]string) {
 	if len(chunk.Words) == 0 {
 		text := strings.TrimSpace(chunk.Text)
 		if text != "" {
@@ -120,7 +120,7 @@ func writeChunk(b *strings.Builder, chunk elevenlabs.TranscriptChunk, diarized, 
 	}
 }
 
-func groupWords(words []elevenlabs.Word) []block {
+func groupWords(words []transcription.Word) []block {
 	const (
 		silenceGapSeconds = 1.5
 		maxBlockSeconds   = 45.0
@@ -220,7 +220,7 @@ func endsSentence(s string) bool {
 	return strings.HasSuffix(s, ".") || strings.HasSuffix(s, "!") || strings.HasSuffix(s, "?")
 }
 
-func speakerLabels(chunks []elevenlabs.TranscriptChunk, names []string) map[string]string {
+func speakerLabels(chunks []transcription.Transcript, names []string) map[string]string {
 	labels := make(map[string]string)
 	for _, chunk := range chunks {
 		for _, word := range chunk.Words {
@@ -256,7 +256,7 @@ func speakerLabels(chunks []elevenlabs.TranscriptChunk, names []string) map[stri
 	return labels
 }
 
-func hasSpeakers(chunks []elevenlabs.TranscriptChunk) bool {
+func hasSpeakers(chunks []transcription.Transcript) bool {
 	for _, chunk := range chunks {
 		for _, word := range chunk.Words {
 			if word.SpeakerID != "" {
@@ -267,7 +267,7 @@ func hasSpeakers(chunks []elevenlabs.TranscriptChunk) bool {
 	return false
 }
 
-func hasChannels(chunks []elevenlabs.TranscriptChunk) bool {
+func hasChannels(chunks []transcription.Transcript) bool {
 	for _, chunk := range chunks {
 		if chunk.ChannelIndex != nil {
 			return true
@@ -281,7 +281,7 @@ func hasChannels(chunks []elevenlabs.TranscriptChunk) bool {
 	return false
 }
 
-func wordSpeakerKey(word elevenlabs.Word) string {
+func wordSpeakerKey(word transcription.Word) string {
 	if word.SpeakerID != "" {
 		return word.SpeakerID
 	}

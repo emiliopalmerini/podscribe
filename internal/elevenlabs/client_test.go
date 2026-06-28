@@ -14,9 +14,10 @@ import (
 	"testing"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
+	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
-func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
+func TestTranscribeStreamsMultipartRequest(t *testing.T) {
 	audio := t.TempDir() + "/episode.mp3"
 	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -78,8 +79,8 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	var progress []UploadProgress
-	resp, raw, err := client.TranscribeFile(context.Background(), TranscribeOptions{
+	var progress []transcription.UploadProgress
+	resp, err := client.Transcribe(context.Background(), transcription.Request{
 		FilePath:              audio,
 		Model:                 "scribe_v2",
 		Language:              "en",
@@ -89,18 +90,22 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 		Clean:                 true,
 		TagAudioEvents:        false,
 		TimestampsGranularity: "word",
-		OnUploadProgress: func(update UploadProgress) {
+		OnUploadProgress: func(update transcription.UploadProgress) {
 			progress = append(progress, update)
 		},
 	})
 	if err != nil {
-		t.Fatalf("TranscribeFile() error = %v", err)
+		t.Fatalf("Transcribe() error = %v", err)
 	}
 	if !sawRequest {
 		t.Fatal("server did not receive request")
 	}
 	if resp.TranscriptionID != "tx_123" {
 		t.Fatalf("transcription ID = %q", resp.TranscriptionID)
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal transcript: %v", err)
 	}
 	if !json.Valid(raw) {
 		t.Fatalf("raw response is not JSON: %q", string(raw))
@@ -114,7 +119,7 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 	}
 }
 
-func TestTranscribeFileSendsMultichannelFields(t *testing.T) {
+func TestTranscribeSendsMultichannelFields(t *testing.T) {
 	audio := t.TempDir() + "/episode.flac"
 	if err := osWriteFile(audio, []byte("fake multichannel audio")); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -156,7 +161,7 @@ func TestTranscribeFileSendsMultichannelFields(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	_, _, err := client.TranscribeFile(context.Background(), TranscribeOptions{
+	_, err := client.Transcribe(context.Background(), transcription.Request{
 		FilePath:                audio,
 		Model:                   "scribe_v2",
 		TagAudioEvents:          true,
@@ -165,7 +170,7 @@ func TestTranscribeFileSendsMultichannelFields(t *testing.T) {
 		MultichannelOutputStyle: "combined",
 	})
 	if err != nil {
-		t.Fatalf("TranscribeFile() error = %v", err)
+		t.Fatalf("Transcribe() error = %v", err)
 	}
 	assertField(t, fields, "use_multi_channel", "true")
 	assertField(t, fields, "multichannel_output_style", "combined")
@@ -194,7 +199,7 @@ func TestGetDeleteAndRawGET(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	if _, _, err := client.GetTranscript(context.Background(), "tx_123"); err != nil {
+	if _, err := client.GetTranscript(context.Background(), "tx_123"); err != nil {
 		t.Fatalf("GetTranscript() error = %v", err)
 	}
 	if _, err := client.DeleteTranscript(context.Background(), "tx_123"); err != nil {
@@ -228,19 +233,16 @@ func TestGetUserParsesStableIdentity(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	user, raw, err := client.GetUser(context.Background())
+	userID, err := client.UserID(context.Background())
 	if err != nil {
-		t.Fatalf("GetUser() error = %v", err)
+		t.Fatalf("UserID() error = %v", err)
 	}
-	if user.UserID != "user_123" || user.SeatType != "workspace_admin" || user.CreatedAt != 1689761411 {
-		t.Fatalf("user = %+v", user)
-	}
-	if !json.Valid(raw) {
-		t.Fatalf("raw response is not JSON: %q", string(raw))
+	if userID != "user_123" {
+		t.Fatalf("user ID = %q", userID)
 	}
 }
 
-func TestSubmitTranscriptionWebhookSendsMetadata(t *testing.T) {
+func TestSubmitWebhookSendsMetadata(t *testing.T) {
 	audio := t.TempDir() + "/episode.mp3"
 	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -285,7 +287,7 @@ func TestSubmitTranscriptionWebhookSendsMetadata(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	resp, _, err := client.SubmitTranscriptionWebhook(context.Background(), TranscribeOptions{
+	resp, err := client.SubmitWebhook(context.Background(), transcription.Request{
 		FilePath:              audio,
 		Model:                 "scribe_v2",
 		TagAudioEvents:        true,
@@ -296,7 +298,7 @@ func TestSubmitTranscriptionWebhookSendsMetadata(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("SubmitTranscriptionWebhook() error = %v", err)
+		t.Fatalf("SubmitWebhook() error = %v", err)
 	}
 	if resp.RequestID != "req_123" || resp.TranscriptionID == nil || *resp.TranscriptionID != "tx_123" {
 		t.Fatalf("webhook response = %+v", resp)
@@ -393,7 +395,7 @@ func TestRawGetRetriesRateLimit(t *testing.T) {
 	}
 }
 
-func TestTranscribeFileRetriesConnectionErrorsWithFreshMultipartRequest(t *testing.T) {
+func TestTranscribeRetriesConnectionErrorsWithFreshMultipartRequest(t *testing.T) {
 	audio := t.TempDir() + "/episode.mp3"
 	if err := osWriteFile(audio, []byte("fake audio")); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -438,20 +440,24 @@ func TestTranscribeFileRetriesConnectionErrorsWithFreshMultipartRequest(t *testi
 		return jsonResponse(req, http.StatusOK, `{"language_code":"en","text":"Hello","words":[],"transcription_id":"tx_123"}`), nil
 	})}
 
-	resp, raw, err := client.TranscribeFile(context.Background(), TranscribeOptions{
+	resp, err := client.Transcribe(context.Background(), transcription.Request{
 		FilePath:              audio,
 		Model:                 "scribe_v2",
 		TagAudioEvents:        true,
 		TimestampsGranularity: "word",
 	})
 	if err != nil {
-		t.Fatalf("TranscribeFile() error = %v", err)
+		t.Fatalf("Transcribe() error = %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
 	}
 	if resp.TranscriptionID != "tx_123" {
 		t.Fatalf("transcription ID = %q", resp.TranscriptionID)
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal transcript: %v", err)
 	}
 	if !json.Valid(raw) {
 		t.Fatalf("raw response is not JSON: %q", string(raw))

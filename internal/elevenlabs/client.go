@@ -7,11 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
-	"mime/multipart"
 	"net"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,7 +16,10 @@ import (
 	"strings"
 	"time"
 
+	el "github.com/emiliopalmerini/elevenlabs-go"
+
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
+	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
 const (
@@ -36,33 +36,10 @@ type Client struct {
 	retryBaseDelay time.Duration
 }
 
-type TranscribeOptions struct {
-	FilePath                string
-	Model                   string
-	Language                string
-	Diarize                 bool
-	Speakers                int
-	Keyterms                []string
-	Clean                   bool
-	TagAudioEvents          bool
-	TimestampsGranularity   string
-	UseMultiChannel         bool
-	MultichannelOutputStyle string
-	Webhook                 bool
-	WebhookID               string
-	WebhookMetadata         map[string]any
-	OnUploadProgress        func(UploadProgress)
-}
-
-type formField struct {
-	name  string
-	value string
-}
-
-type UploadProgress struct {
-	SentBytes  int64
-	TotalBytes int64
-}
+var (
+	_ transcription.Provider  = (*Client)(nil)
+	_ transcription.RawGetter = (*Client)(nil)
+)
 
 func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
@@ -76,145 +53,214 @@ func NewClient(baseURL, apiKey string) *Client {
 	}
 }
 
-func (c *Client) TranscribeFile(ctx context.Context, opts TranscribeOptions) (TranscriptResponse, []byte, error) {
-	if c.APIKey == "" {
-		return TranscriptResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
-	}
-	endpoint, err := c.endpoint("/v1/speech-to-text")
+func (c *Client) Check(ctx context.Context) error {
+	client, err := c.sdkClient()
 	if err != nil {
-		return TranscriptResponse{}, nil, err
+		return err
 	}
-
-	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
-		return c.newTranscribeRequest(ctx, endpoint, opts)
-	})
-	if err != nil {
-		return TranscriptResponse{}, nil, err
+	if _, err := client.ListModels(ctx); err != nil {
+		return wrapSDKError(err, "")
 	}
-	var transcript TranscriptResponse
-	if err := json.Unmarshal(raw, &transcript); err != nil {
-		return TranscriptResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs transcript response", err)
-	}
-	return transcript, raw, nil
+	return nil
 }
 
-func (c *Client) SubmitTranscriptionWebhook(ctx context.Context, opts TranscribeOptions) (WebhookResponse, []byte, error) {
-	if c.APIKey == "" {
-		return WebhookResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
-	}
-	endpoint, err := c.endpoint("/v1/speech-to-text")
+func (c *Client) UserID(ctx context.Context) (string, error) {
+	client, err := c.sdkClient()
 	if err != nil {
-		return WebhookResponse{}, nil, err
+		return "", err
 	}
-	opts.Webhook = true
-
-	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
-		return c.newTranscribeRequest(ctx, endpoint, opts)
-	})
+	user, err := client.GetUser(ctx)
 	if err != nil {
-		return WebhookResponse{}, nil, err
+		return "", wrapSDKError(err, "")
 	}
-	var response WebhookResponse
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return WebhookResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs webhook response", err)
+	if user == nil {
+		return "", apperr.New(apperr.CodeAPI, "ElevenLabs user response was empty")
 	}
-	return response, raw, nil
+	if strings.TrimSpace(user.UserID) == "" {
+		return "", apperr.New(apperr.CodeAPI, "ElevenLabs user response did not include user_id")
+	}
+	return user.UserID, nil
 }
 
-func (c *Client) newTranscribeRequest(ctx context.Context, endpoint string, opts TranscribeOptions) (*http.Request, error) {
-	file, err := os.Open(opts.FilePath)
+func (c *Client) Transcribe(ctx context.Context, req transcription.Request) (transcription.Transcript, error) {
+	client, err := c.sdkClient()
 	if err != nil {
-		return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not open audio file %s", opts.FilePath), err)
+		return transcription.Transcript{}, err
+	}
+	file, size, err := openAudioFile(req.FilePath)
+	if err != nil {
+		return transcription.Transcript{}, err
+	}
+	defer file.Close()
+
+	transcript, err := client.CreateTranscript(ctx, sdkTranscriptRequest(req, file, size))
+	if err != nil {
+		return transcription.Transcript{}, wrapSDKError(err, "could not parse ElevenLabs transcript response")
+	}
+	return convertTranscript(transcript)
+}
+
+func (c *Client) SubmitWebhook(ctx context.Context, req transcription.Request) (transcription.WebhookResponse, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return transcription.WebhookResponse{}, err
+	}
+	file, size, err := openAudioFile(req.FilePath)
+	if err != nil {
+		return transcription.WebhookResponse{}, err
+	}
+	defer file.Close()
+
+	response, err := client.SubmitTranscriptWebhook(ctx, sdkTranscriptRequest(req, file, size))
+	if err != nil {
+		return transcription.WebhookResponse{}, wrapSDKError(err, "could not parse ElevenLabs webhook response")
+	}
+	if response == nil {
+		return transcription.WebhookResponse{}, apperr.New(apperr.CodeAPI, "ElevenLabs webhook response was empty")
+	}
+	return transcription.WebhookResponse{
+		Message:         response.Message,
+		RequestID:       response.RequestID,
+		TranscriptionID: response.TranscriptionID,
+	}, nil
+}
+
+func (c *Client) GetTranscript(ctx context.Context, id string) (transcription.Transcript, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return transcription.Transcript{}, err
+	}
+	transcript, err := client.GetTranscript(ctx, id)
+	if err != nil {
+		return transcription.Transcript{}, wrapSDKError(err, "could not parse ElevenLabs transcript response")
+	}
+	return convertTranscript(transcript)
+}
+
+func (c *Client) DeleteTranscript(ctx context.Context, id string) (any, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.DeleteTranscriptWithResponse(ctx, id)
+	if err != nil {
+		return nil, wrapSDKError(err, "")
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) sdkClient() (*el.Client, error) {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
+	}
+	if err := validateBaseURL(c.BaseURL); err != nil {
+		return nil, err
+	}
+	return el.NewClient(
+		c.APIKey,
+		el.WithBaseURL(strings.TrimRight(c.BaseURL, "/")),
+		el.WithHTTPClient(c.httpClient()),
+		el.WithRetryConfig(c.sdkRetryConfig()),
+	), nil
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return http.DefaultClient
+}
+
+func (c *Client) sdkRetryConfig() el.RetryConfig {
+	baseDelay := c.retryBaseDelay
+	maxDelay := defaultRetryMaxDelay
+	if baseDelay <= 0 {
+		baseDelay = time.Nanosecond
+		maxDelay = time.Nanosecond
+	}
+	return el.RetryConfig{
+		MaxAttempts: c.attempts(),
+		BaseDelay:   baseDelay,
+		MaxDelay:    maxDelay,
+	}
+}
+
+func sdkTranscriptRequest(req transcription.Request, file *os.File, size int64) el.CreateTranscriptRequest {
+	out := el.CreateTranscriptRequest{
+		ModelID:                 req.Model,
+		File:                    &el.File{Name: filepath.Base(req.FilePath), Reader: file, SizeBytes: size},
+		LanguageCode:            req.Language,
+		TimestampsGranularity:   req.TimestampsGranularity,
+		NumSpeakers:             req.Speakers,
+		WebhookID:               req.WebhookID,
+		WebhookMetadata:         req.WebhookMetadata,
+		MultichannelOutputStyle: req.MultichannelOutputStyle,
+		Keyterms:                req.Keyterms,
+	}
+	if req.OnUploadProgress != nil {
+		out.OnUploadProgress = func(update el.UploadProgress) {
+			req.OnUploadProgress(transcription.UploadProgress{
+				SentBytes:  update.SentBytes,
+				TotalBytes: update.TotalBytes,
+				Done:       update.Done,
+				Attempt:    update.Attempt,
+			})
+		}
+	}
+	if req.Diarize {
+		out.Diarize = boolPtr(true)
+	}
+	out.TagAudioEvents = boolPtr(req.TagAudioEvents)
+	if req.Clean {
+		out.NoVerbatim = boolPtr(true)
+	}
+	if req.UseMultiChannel {
+		out.UseMultiChannel = boolPtr(true)
+	}
+	return out
+}
+
+func openAudioFile(path string) (*os.File, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not open audio file %s", path), err)
 	}
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", opts.FilePath), err)
+		return nil, 0, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", path), err)
 	}
-
-	pr, pw := io.Pipe()
-	writer := multipart.NewWriter(pw)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
-	if err != nil {
-		file.Close()
-		pw.CloseWithError(err)
-		return nil, apperr.Wrap(apperr.CodeInvalidInput, "could not build transcription request", err)
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("xi-api-key", c.APIKey)
-
-	go func() {
-		defer file.Close()
-		if err := writeTranscribeMultipart(writer, opts, file, info.Size()); err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		if err := writer.Close(); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
-
-	return req, nil
+	return file, info.Size(), nil
 }
 
-func (c *Client) GetTranscript(ctx context.Context, id string) (TranscriptResponse, []byte, error) {
-	if c.APIKey == "" {
-		return TranscriptResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
-	}
-	endpoint, err := c.endpoint("/v1/speech-to-text/transcripts/" + url.PathEscape(id))
-	if err != nil {
-		return TranscriptResponse{}, nil, err
-	}
-	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
-		return c.newAPIRequest(ctx, http.MethodGet, endpoint, "could not build get transcript request")
-	})
-	if err != nil {
-		return TranscriptResponse{}, nil, err
-	}
-	var transcript TranscriptResponse
-	if err := json.Unmarshal(raw, &transcript); err != nil {
-		return TranscriptResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs transcript response", err)
-	}
-	return transcript, raw, nil
+func boolPtr(v bool) *bool {
+	return &v
 }
 
-func (c *Client) DeleteTranscript(ctx context.Context, id string) ([]byte, error) {
-	if c.APIKey == "" {
-		return nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
+func convertTranscript(in *el.Transcript) (transcription.Transcript, error) {
+	if in == nil {
+		return transcription.Transcript{}, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
 	}
-	endpoint, err := c.endpoint("/v1/speech-to-text/transcripts/" + url.PathEscape(id))
-	if err != nil {
-		return nil, err
+	var out transcription.Transcript
+	if err := convertJSON(in, &out); err != nil {
+		return transcription.Transcript{}, apperr.Wrap(apperr.CodeAPI, "could not convert ElevenLabs transcript response", err)
 	}
-	return c.do(ctx, func(ctx context.Context) (*http.Request, error) {
-		return c.newAPIRequest(ctx, http.MethodDelete, endpoint, "could not build delete transcript request")
-	})
+	return out, nil
 }
 
-func (c *Client) GetUser(ctx context.Context) (UserResponse, []byte, error) {
-	if c.APIKey == "" {
-		return UserResponse{}, nil, apperr.New(apperr.CodeAuth, "missing ElevenLabs API key")
-	}
-	endpoint, err := c.endpoint("/v1/user")
+func convertJSON(in, out any) error {
+	raw, err := json.Marshal(in)
 	if err != nil {
-		return UserResponse{}, nil, err
+		return err
 	}
-	raw, err := c.do(ctx, func(ctx context.Context) (*http.Request, error) {
-		return c.newAPIRequest(ctx, http.MethodGet, endpoint, "could not build get user request")
-	})
-	if err != nil {
-		return UserResponse{}, nil, err
-	}
-	var user UserResponse
-	if err := json.Unmarshal(raw, &user); err != nil {
-		return UserResponse{}, raw, apperr.Wrap(apperr.CodeAPI, "could not parse ElevenLabs user response", err)
-	}
-	if strings.TrimSpace(user.UserID) == "" {
-		return UserResponse{}, raw, apperr.New(apperr.CodeAPI, "ElevenLabs user response did not include user_id")
-	}
-	return user, raw, nil
+	return json.Unmarshal(raw, out)
+}
+
+func RawGetClient(baseURL, apiKey string) *Client {
+	return NewClient(baseURL, apiKey)
 }
 
 func (c *Client) RawGet(ctx context.Context, path string) ([]byte, error) {
@@ -245,122 +291,26 @@ func (c *Client) newAPIRequest(ctx context.Context, method, endpoint, buildError
 	return req, nil
 }
 
-func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, file *os.File, totalBytes int64) error {
-	fields := []formField{
-		{name: "model_id", value: opts.Model},
-		{name: "timestamps_granularity", value: opts.TimestampsGranularity},
-	}
-	if opts.UseMultiChannel {
-		fields = append(fields, formField{name: "use_multi_channel", value: "true"})
-		if opts.MultichannelOutputStyle != "" {
-			fields = append(fields, formField{name: "multichannel_output_style", value: opts.MultichannelOutputStyle})
-		}
-	}
-	if opts.Language != "" {
-		fields = append(fields, formField{name: "language_code", value: opts.Language})
-	}
-	if opts.Diarize {
-		fields = append(fields, formField{name: "diarize", value: "true"})
-	}
-	if opts.Speakers > 0 {
-		fields = append(fields, formField{name: "num_speakers", value: strconv.Itoa(opts.Speakers)})
-	}
-	if !opts.TagAudioEvents {
-		fields = append(fields, formField{name: "tag_audio_events", value: "false"})
-	}
-	if opts.Clean {
-		fields = append(fields, formField{name: "no_verbatim", value: "true"})
-	}
-	if opts.Webhook {
-		fields = append(fields, formField{name: "webhook", value: "true"})
-	}
-	if opts.WebhookID != "" {
-		fields = append(fields, formField{name: "webhook_id", value: opts.WebhookID})
-	}
-	if len(opts.WebhookMetadata) > 0 {
-		metadata, err := json.Marshal(opts.WebhookMetadata)
-		if err != nil {
-			return apperr.Wrap(apperr.CodeInvalidInput, "could not encode webhook metadata", err)
-		}
-		fields = append(fields, formField{name: "webhook_metadata", value: string(metadata)})
-	}
-	for _, field := range fields {
-		if err := writer.WriteField(field.name, field.value); err != nil {
-			return apperr.Wrap(apperr.CodeFilesystem, "could not write multipart field", err)
-		}
-	}
-	for _, term := range opts.Keyterms {
-		if err := writer.WriteField("keyterms", term); err != nil {
-			return apperr.Wrap(apperr.CodeFilesystem, "could not write keyterm field", err)
-		}
-	}
-
-	partHeader := make(textproto.MIMEHeader)
-	filename := filepath.Base(opts.FilePath)
-	partHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, escapeQuotes(filename)))
-	partHeader.Set("Content-Type", contentTypeFor(filename))
-	part, err := writer.CreatePart(partHeader)
-	if err != nil {
-		return apperr.Wrap(apperr.CodeFilesystem, "could not create multipart file part", err)
-	}
-	var reader io.Reader = file
-	if opts.OnUploadProgress != nil {
-		opts.OnUploadProgress(UploadProgress{SentBytes: 0, TotalBytes: totalBytes})
-		reader = &progressReader{
-			reader: file,
-			total:  totalBytes,
-			report: opts.OnUploadProgress,
-		}
-	}
-	if _, err := io.Copy(part, reader); err != nil {
-		return apperr.Wrap(apperr.CodeFilesystem, "could not stream audio file into multipart request", err)
-	}
-	return nil
-}
-
-type progressReader struct {
-	reader io.Reader
-	sent   int64
-	total  int64
-	report func(UploadProgress)
-}
-
-func (r *progressReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	if n > 0 {
-		r.sent += int64(n)
-		r.report(UploadProgress{SentBytes: r.sent, TotalBytes: r.total})
-	}
-	return n, err
-}
-
-func escapeQuotes(s string) string {
-	return strings.NewReplacer("\\", "\\\\", `"`, "\\\"").Replace(s)
-}
-
-func contentTypeFor(filename string) string {
-	if typ := mime.TypeByExtension(filepath.Ext(filename)); typ != "" {
-		return typ
-	}
-	return "application/octet-stream"
-}
-
 func (c *Client) endpoint(path string) (string, error) {
-	if strings.TrimSpace(c.BaseURL) == "" {
-		return "", apperr.New(apperr.CodeConfig, "missing ElevenLabs base URL")
-	}
-	base, err := url.Parse(c.BaseURL)
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return "", apperr.New(apperr.CodeConfig, "invalid ElevenLabs base URL")
+	if err := validateBaseURL(c.BaseURL); err != nil {
+		return "", err
 	}
 	return strings.TrimRight(c.BaseURL, "/") + path, nil
 }
 
-func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*http.Request, error)) ([]byte, error) {
-	httpClient := c.HTTPClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+func validateBaseURL(baseURL string) error {
+	if strings.TrimSpace(baseURL) == "" {
+		return apperr.New(apperr.CodeConfig, "missing ElevenLabs base URL")
 	}
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return apperr.New(apperr.CodeConfig, "invalid ElevenLabs base URL")
+	}
+	return nil
+}
+
+func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*http.Request, error)) ([]byte, error) {
+	httpClient := c.httpClient()
 	attempts := c.attempts()
 	for attempt := 1; attempt <= attempts; attempt++ {
 		req, err := buildRequest(ctx)
@@ -394,6 +344,29 @@ func (c *Client) do(ctx context.Context, buildRequest func(context.Context) (*ht
 		return body, nil
 	}
 	return nil, apperr.New(apperr.CodeNetwork, "request to ElevenLabs failed")
+}
+
+func wrapSDKError(err error, parseMessage string) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *el.APIError
+	if errors.As(err, &apiErr) {
+		return newAPIErrorFromSDK(apiErr)
+	}
+	if parseMessage != "" && strings.Contains(err.Error(), "decode response") {
+		return apperr.Wrap(apperr.CodeAPI, parseMessage, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isNetworkError(err) {
+		return apperr.Wrap(apperr.CodeNetwork, "request to ElevenLabs failed", err)
+	}
+	if strings.Contains(err.Error(), "base url") {
+		return apperr.Wrap(apperr.CodeConfig, "invalid ElevenLabs base URL", err)
+	}
+	if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "audio source") {
+		return apperr.Wrap(apperr.CodeInvalidInput, err.Error(), err)
+	}
+	return apperr.Wrap(apperr.CodeUnexpected, "ElevenLabs SDK request failed", err)
 }
 
 func shouldRetryRateLimit(statusCode, attempt, attempts int) bool {
@@ -464,6 +437,15 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func isNetworkError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func isRetryableConnectionError(err error) bool {

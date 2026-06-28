@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 
+	el "github.com/emiliopalmerini/elevenlabs-go"
+
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/output"
 )
@@ -34,6 +36,24 @@ func (e *APIError) Error() string {
 
 func newAPIError(res *http.Response, body []byte) error {
 	apiErr := parseAPIError(res, body)
+	apiErr.redact()
+	return apperr.Wrap(apiErr.code(), apiErr.message(), apiErr)
+}
+
+func newAPIErrorFromSDK(err *el.APIError) error {
+	apiErr := &APIError{
+		StatusCode:      err.StatusCode,
+		Status:          err.Status,
+		ProviderType:    err.ProviderType,
+		ProviderCode:    err.ProviderCode,
+		ProviderStatus:  err.ProviderStatus,
+		ProviderMessage: firstNonEmpty(err.ProviderMessage, err.Message),
+		RequestID:       err.RequestID,
+		TraceID:         err.TraceID,
+		RetryAfter:      err.RetryAfter,
+		Body:            output.Redact(compactBody(err.Body)),
+		Validation:      summarizeSDKValidation(err.Validation),
+	}
 	apiErr.redact()
 	return apperr.Wrap(apiErr.code(), apiErr.message(), apiErr)
 }
@@ -211,6 +231,18 @@ func summarizeValidation(items []validationError) []string {
 		summaries = append(summaries, fmt.Sprintf("%d more validation errors", len(items)-maxValidationItems))
 	}
 	return summaries
+}
+
+func summarizeSDKValidation(items []el.ValidationError) []string {
+	validation := make([]validationError, 0, len(items))
+	for _, item := range items {
+		validation = append(validation, validationError{
+			Loc:  item.Loc,
+			Msg:  item.Msg,
+			Type: item.Type,
+		})
+	}
+	return summarizeValidation(validation)
 }
 
 func formatValidationLoc(parts []any) string {
