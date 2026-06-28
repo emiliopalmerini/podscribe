@@ -573,6 +573,143 @@ func TestTranscribeTracksMergesAndUploadsMultichannelAudio(t *testing.T) {
 	}
 }
 
+func TestTranscribeTracksCanUploadMixedDownAudio(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "ffmpeg-args.txt")
+	installFakeMergeTools(t, dir, argsPath)
+	emilio := filepath.Join(dir, "emilio.wav")
+	guest := filepath.Join(dir, "guest.wav")
+	for _, path := range []string{emilio, guest} {
+		if err := os.WriteFile(path, []byte("track audio"), 0o644); err != nil {
+			t.Fatalf("write track: %v", err)
+		}
+	}
+
+	var fields map[string][]string
+	var uploaded string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1}`))
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		fields = map[string][]string{}
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("read multipart part: %v", err)
+			}
+			if part.FormName() == "file" {
+				uploaded = string(b)
+				continue
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(b))
+		}
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello. Thanks!","words":[{"text":"Hello.","start":1.0,"end":1.2,"type":"word","speaker_id":"speaker_0"},{"text":"Thanks!","start":1.5,"end":1.8,"type":"word","speaker_id":"speaker_1"}],"transcription_id":"tx_123"}`))
+	}))
+	defer server.Close()
+
+	outPath := filepath.Join(dir, "episode.md")
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe",
+		"--track", "Emilio=" + emilio,
+		"--track", "Guest=" + guest,
+		"--track-offset", "Guest=1.5s",
+		"--track-mixdown",
+		"--out", outPath,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	if uploaded != "merged audio" {
+		t.Fatalf("uploaded file content = %q, want mixed audio", uploaded)
+	}
+	if got := strings.Join(fields["use_multi_channel"], "|"); got != "" {
+		t.Fatalf("use_multi_channel fields = %q, want unset", got)
+	}
+	if got := strings.Join(fields["multichannel_output_style"], "|"); got != "" {
+		t.Fatalf("multichannel_output_style fields = %q, want unset", got)
+	}
+	if got := strings.Join(fields["diarize"], "|"); got != "true" {
+		t.Fatalf("diarize fields = %q, want true", got)
+	}
+	if got := strings.Join(fields["num_speakers"], "|"); got != "2" {
+		t.Fatalf("num_speakers fields = %q, want 2", got)
+	}
+
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg args: %v", err)
+	}
+	args := string(argsBytes)
+	if !strings.Contains(args, "amix=inputs=2:duration=longest") {
+		t.Fatalf("ffmpeg args missing mixdown filter:\n%s", args)
+	}
+	if strings.Contains(args, "amerge=inputs=2") {
+		t.Fatalf("ffmpeg args used multichannel merge:\n%s", args)
+	}
+
+	md, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	for _, want := range []string{
+		"Emilio: Hello.",
+		"Guest: Thanks!",
+	} {
+		if !strings.Contains(string(md), want) {
+			t.Fatalf("transcript missing %q:\n%s", want, string(md))
+		}
+	}
+	for _, want := range []string{
+		"Track mixdown map:",
+		"Track 2: Guest",
+		"Mixed down 2 tracks",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+
+	entries, err := jobstore.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("job cache entries = %d, want 1", len(entries))
+	}
+	record := entries[0].Record
+	if record.RemoteRequest.UseMultiChannel {
+		t.Fatalf("UseMultiChannel = true, want false")
+	}
+	if !record.RemoteRequest.Diarize || record.RemoteRequest.Speakers != 2 {
+		t.Fatalf("remote request = %+v, want diarize with 2 speakers", record.RemoteRequest)
+	}
+	if len(record.InputTracks) != 2 || record.InputTracks[1].Name != "Guest" || record.InputTracks[1].OffsetNanos != int64(1500*time.Millisecond) {
+		t.Fatalf("input tracks = %+v, want stored track metadata", record.InputTracks)
+	}
+}
+
 func TestCollectTracksParsesOffsets(t *testing.T) {
 	dir := t.TempDir()
 	host := filepath.Join(dir, "host.wav")
@@ -586,6 +723,7 @@ func TestCollectTracksParsesOffsets(t *testing.T) {
 	tracks, err := collectTracks(
 		[]string{"Host=" + host, "Guest=" + guest},
 		[]string{"Guest=1.25", "Host=-500ms"},
+		false,
 	)
 	if err != nil {
 		t.Fatalf("collectTracks() error = %v", err)
@@ -594,7 +732,7 @@ func TestCollectTracksParsesOffsets(t *testing.T) {
 		t.Fatalf("offsets = %s, %s; want -500ms and 1.25s", tracks[0].Offset, tracks[1].Offset)
 	}
 
-	if _, err := collectTracks([]string{"Host=" + host}, []string{"Guest=1s"}); err == nil {
+	if _, err := collectTracks([]string{"Host=" + host}, []string{"Guest=1s"}, false); err == nil {
 		t.Fatal("collectTracks() error = nil, want unknown track offset error")
 	}
 }

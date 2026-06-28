@@ -234,6 +234,7 @@ func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command
 	cmd.Flags().StringVar(&flags.keytermsFile, "keyterms-file", "", "file with one keyterm per line")
 	cmd.Flags().StringArrayVar(&flags.tracks, "track", nil, "speaker track as name=audio-file; repeatable for multichannel upload")
 	cmd.Flags().StringArrayVar(&flags.trackOffsets, "track-offset", nil, "speaker track offset as name=duration, for example Guest=1.42s or Guest=-500ms")
+	cmd.Flags().BoolVar(&flags.trackMixdown, "track-mixdown", false, "mix --track inputs into one audio file instead of preserving separate channels")
 	cmd.Flags().BoolVar(&flags.clean, "clean", false, "remove fillers and non-speech artifacts where supported")
 	cmd.Flags().BoolVar(&flags.noAudioEvents, "no-audio-events", false, "disable audio event tags such as laughter")
 	cmd.Flags().BoolVar(&flags.timestamps, "timestamps", false, "include timestamps in Markdown transcript blocks")
@@ -256,6 +257,7 @@ type transcribeFlags struct {
 	keytermsFile     string
 	tracks           []string
 	trackOffsets     []string
+	trackMixdown     bool
 	clean            bool
 	noAudioEvents    bool
 	timestamps       bool
@@ -276,6 +278,7 @@ type transcribeInput struct {
 	UploadSize        int64
 	AudioHash         string
 	MultiChannel      bool
+	TrackMixdown      bool
 	Tracks            []audiomerge.Track
 	SpeakerNames      []string
 }
@@ -371,24 +374,42 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 
 	uploadPath := input.UploadPath
 	audioSize := input.UploadSize
-	if input.MultiChannel {
-		if !opts.json {
-			writeTrackMap(opts.errOut, input.Tracks)
-			fmt.Fprintln(opts.errOut, "Merging tracks into temporary multichannel audio...")
+	if len(input.Tracks) > 0 {
+		var tempPath string
+		var mergeResult audiomerge.Result
+		if input.TrackMixdown {
+			if !opts.json {
+				writeTrackMixdownMap(opts.errOut, input.Tracks)
+				fmt.Fprintln(opts.errOut, "Mixing tracks down into temporary audio...")
+			}
+			tempPath, err = audiomerge.TempMixdownOutputPath()
+			if err != nil {
+				return err
+			}
+			mergeResult, err = audiomerge.Mixdown(ctx, audiomerge.Request{Tracks: input.Tracks, OutputPath: tempPath})
+		} else {
+			if !opts.json {
+				writeTrackMap(opts.errOut, input.Tracks)
+				fmt.Fprintln(opts.errOut, "Merging tracks into temporary multichannel audio...")
+			}
+			tempPath, err = audiomerge.TempOutputPath()
+			if err != nil {
+				return err
+			}
+			mergeResult, err = audiomerge.Merge(ctx, audiomerge.Request{Tracks: input.Tracks, OutputPath: tempPath})
 		}
-		tempPath, err := audiomerge.TempOutputPath()
 		if err != nil {
 			return err
 		}
 		defer os.Remove(tempPath)
-		mergeResult, err := audiomerge.Merge(ctx, audiomerge.Request{Tracks: input.Tracks, OutputPath: tempPath})
-		if err != nil {
-			return err
-		}
 		uploadPath = mergeResult.Path
 		audioSize = mergeResult.Size
 		if !opts.json {
-			fmt.Fprintf(opts.errOut, "Merged %d tracks into %s (%s).\n", len(input.Tracks), uploadPath, formatBytes(audioSize))
+			if input.TrackMixdown {
+				fmt.Fprintf(opts.errOut, "Mixed down %d tracks into %s (%s).\n", len(input.Tracks), uploadPath, formatBytes(audioSize))
+			} else {
+				fmt.Fprintf(opts.errOut, "Merged %d tracks into %s (%s).\n", len(input.Tracks), uploadPath, formatBytes(audioSize))
+			}
 		}
 	}
 
@@ -519,13 +540,30 @@ func resolveTranscribeInput(flags transcribeFlags, audioPath string) (transcribe
 		}, nil
 	}
 
-	tracks, err := collectTracks(flags.tracks, flags.trackOffsets)
+	tracks, err := collectTracks(flags.tracks, flags.trackOffsets, flags.trackMixdown)
 	if err != nil {
 		return transcribeInput{}, err
 	}
-	audioHash, err := audiomerge.ContentHash(tracks)
+	var audioHash string
+	if flags.trackMixdown {
+		audioHash, err = audiomerge.MixdownContentHash(tracks)
+	} else {
+		audioHash, err = audiomerge.ContentHash(tracks)
+	}
 	if err != nil {
 		return transcribeInput{}, err
+	}
+	speakerNames := trackNames(tracks)
+	if flags.trackMixdown && (len(flags.speakerNames) > 0 || flags.speakerNamesFile != "") {
+		speakerNames, err = collectSpeakerNames(flags.speakerNames, flags.speakerNamesFile)
+		if err != nil {
+			return transcribeInput{}, err
+		}
+	}
+	if flags.trackMixdown {
+		if err := validateSpeakerNames(speakerNames, flags.speakers); err != nil {
+			return transcribeInput{}, err
+		}
 	}
 	return transcribeInput{
 		SourceLabel:       trackSourceLabel(tracks),
@@ -533,9 +571,10 @@ func resolveTranscribeInput(flags transcribeFlags, audioPath string) (transcribe
 		TitleSourcePath:   tracks[0].Path,
 		DefaultOutputPath: defaultTranscriptPath(tracks[0].Path),
 		AudioHash:         audioHash,
-		MultiChannel:      true,
+		MultiChannel:      !flags.trackMixdown,
+		TrackMixdown:      flags.trackMixdown,
 		Tracks:            tracks,
-		SpeakerNames:      trackNames(tracks),
+		SpeakerNames:      speakerNames,
 	}, nil
 }
 
@@ -591,7 +630,7 @@ func newJobRecord(jobKey, accountNamespace, baseURL, audioHash, requestHash stri
 	}
 }
 
-func collectTracks(trackSpecs, offsetSpecs []string) ([]audiomerge.Track, error) {
+func collectTracks(trackSpecs, offsetSpecs []string, mixdown bool) ([]audiomerge.Track, error) {
 	tracks := make([]audiomerge.Track, 0, len(trackSpecs))
 	for _, spec := range trackSpecs {
 		name, path, ok := strings.Cut(spec, "=")
@@ -634,6 +673,9 @@ func collectTracks(trackSpecs, offsetSpecs []string) ([]audiomerge.Track, error)
 	}
 	for name := range offsets {
 		return nil, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("--track-offset references unknown track %q", name))
+	}
+	if mixdown {
+		return audiomerge.ValidateMixdownTracks(tracks)
 	}
 	return audiomerge.ValidateTracks(tracks)
 }
@@ -688,6 +730,13 @@ func writeTrackMap(w io.Writer, tracks []audiomerge.Track) {
 	fmt.Fprintln(w, "Multichannel track map:")
 	for i, track := range tracks {
 		fmt.Fprintf(w, "Channel %d: %s  %s  offset %s\n", i, track.Name, track.Path, track.Offset.String())
+	}
+}
+
+func writeTrackMixdownMap(w io.Writer, tracks []audiomerge.Track) {
+	fmt.Fprintln(w, "Track mixdown map:")
+	for i, track := range tracks {
+		fmt.Fprintf(w, "Track %d: %s  %s  offset %s\n", i+1, track.Name, track.Path, track.Offset.String())
 	}
 }
 
@@ -1270,14 +1319,17 @@ func validateTranscribeFlags(flags transcribeFlags) error {
 	if len(flags.trackOffsets) > 0 && len(flags.tracks) == 0 {
 		return apperr.New(apperr.CodeInvalidInput, "--track-offset requires --track")
 	}
+	if flags.trackMixdown && len(flags.tracks) == 0 {
+		return apperr.New(apperr.CodeInvalidInput, "--track-mixdown requires --track")
+	}
 	if len(flags.tracks) > 0 {
-		if flags.diarize {
+		if !flags.trackMixdown && flags.diarize {
 			return apperr.New(apperr.CodeInvalidInput, "--diarize cannot be used with --track")
 		}
-		if flags.speakers > 0 {
+		if !flags.trackMixdown && flags.speakers > 0 {
 			return apperr.New(apperr.CodeInvalidInput, "--speakers cannot be used with --track")
 		}
-		if len(flags.speakerNames) > 0 || flags.speakerNamesFile != "" {
+		if !flags.trackMixdown && (len(flags.speakerNames) > 0 || flags.speakerNamesFile != "") {
 			return apperr.New(apperr.CodeInvalidInput, "--speaker-name and --speaker-names-file cannot be used with --track; use the --track names instead")
 		}
 	}

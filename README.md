@@ -88,7 +88,7 @@ podscribe transcribe \
   --out episode.transcript.md
 ```
 
-Track names become channel labels in the transcript. Use `--track-offset` when a file starts late or early:
+By default, track names become channel labels in the transcript. Track mode works best with isolated speaker tracks; Combo tracks that include the full call or heavy bleed can produce duplicated text across channels. Use `--track-offset` when a file starts late or early:
 
 ```bash
 podscribe transcribe \
@@ -97,7 +97,19 @@ podscribe transcribe \
   --track-offset "Guest=1.42s"
 ```
 
-Positive offsets add leading silence; negative offsets trim from the start. Track mode requires `ffmpeg` and `ffprobe`, supports two to five tracks, and uploads a temporary multichannel FLAC with ElevenLabs `use_multi_channel=true` and `multichannel_output_style=combined`.
+Positive offsets add leading silence; negative offsets trim from the start. Default track mode requires `ffmpeg` and `ffprobe`, supports two to five tracks, and uploads a temporary multichannel FLAC with ElevenLabs `use_multi_channel=true` and `multichannel_output_style=combined`.
+
+If the source files are Combo tracks or otherwise not isolated, mix them into one temporary FLAC instead of preserving separate channels:
+
+```bash
+podscribe transcribe \
+  --track "Emilio=emilio.wav" \
+  --track "Guest=guest.wav" \
+  --track-mixdown \
+  --out episode.transcript.md
+```
+
+In mixdown mode, track names are used as default diarization speaker names, and you can override them with `--speaker-name` or `--speaker-names-file`. Mixdown mode uploads normal single-audio transcription without ElevenLabs multichannel fields and supports two to thirty-two tracks.
 
 Save the raw ElevenLabs JSON alongside the Markdown:
 

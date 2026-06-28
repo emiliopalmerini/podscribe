@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	MinTracks = 2
-	MaxTracks = 5
+	MinTracks             = 2
+	MaxMultichannelTracks = 5
+	MaxMixdownTracks      = 32
 )
 
 type Track struct {
@@ -42,7 +43,15 @@ type Result struct {
 }
 
 func Merge(ctx context.Context, req Request) (Result, error) {
-	tracks, err := ValidateTracks(req.Tracks)
+	return merge(ctx, req, ValidateTracks, ffmpegArgs, "merge audio tracks")
+}
+
+func Mixdown(ctx context.Context, req Request) (Result, error) {
+	return merge(ctx, req, ValidateMixdownTracks, ffmpegMixdownArgs, "mix down audio tracks")
+}
+
+func merge(ctx context.Context, req Request, validate func([]Track) ([]Track, error), buildArgs func([]Track, string, time.Duration) []string, action string) (Result, error) {
+	tracks, err := validate(req.Tracks)
 	if err != nil {
 		return Result{}, err
 	}
@@ -68,12 +77,12 @@ func Merge(ctx context.Context, req Request) (Result, error) {
 		return Result{}, apperr.New(apperr.CodeInvalidInput, "merged audio duration must be greater than 0")
 	}
 
-	args := ffmpegArgs(tracks, req.OutputPath, outputDuration)
+	args := buildArgs(tracks, req.OutputPath, outputDuration)
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return Result{}, apperr.Wrap(apperr.CodeFilesystem, strings.TrimSpace("could not merge audio tracks with ffmpeg: "+stderr.String()), err)
+		return Result{}, apperr.Wrap(apperr.CodeFilesystem, strings.TrimSpace("could not "+action+" with ffmpeg: "+stderr.String()), err)
 	}
 	info, err := os.Stat(req.OutputPath)
 	if err != nil {
@@ -86,11 +95,19 @@ func Merge(ctx context.Context, req Request) (Result, error) {
 }
 
 func ValidateTracks(tracks []Track) ([]Track, error) {
+	return validateTracks(tracks, MaxMultichannelTracks, "ElevenLabs multichannel transcription supports at most 5 tracks")
+}
+
+func ValidateMixdownTracks(tracks []Track) ([]Track, error) {
+	return validateTracks(tracks, MaxMixdownTracks, "track mixdown supports at most 32 tracks")
+}
+
+func validateTracks(tracks []Track, maxTracks int, maxMessage string) ([]Track, error) {
 	if len(tracks) < MinTracks {
 		return nil, apperr.New(apperr.CodeInvalidInput, "provide at least two --track values")
 	}
-	if len(tracks) > MaxTracks {
-		return nil, apperr.New(apperr.CodeInvalidInput, "ElevenLabs multichannel transcription supports at most 5 tracks")
+	if len(tracks) > maxTracks {
+		return nil, apperr.New(apperr.CodeInvalidInput, maxMessage)
 	}
 
 	out := make([]Track, 0, len(tracks))
@@ -124,7 +141,15 @@ func ValidateTracks(tracks []Track) ([]Track, error) {
 }
 
 func ContentHash(tracks []Track) (string, error) {
-	tracks, err := ValidateTracks(tracks)
+	return contentHash(tracks, ValidateTracks, "podscribe:multichannel:v1")
+}
+
+func MixdownContentHash(tracks []Track) (string, error) {
+	return contentHash(tracks, ValidateMixdownTracks, "podscribe:track-mixdown:v1")
+}
+
+func contentHash(tracks []Track, validate func([]Track) ([]Track, error), version string) (string, error) {
+	tracks, err := validate(tracks)
 	if err != nil {
 		return "", err
 	}
@@ -137,7 +162,7 @@ func ContentHash(tracks []Track) (string, error) {
 		Version string        `json:"version"`
 		Tracks  []hashedTrack `json:"tracks"`
 	}{
-		Version: "podscribe:multichannel:v1",
+		Version: version,
 	}
 	for i, track := range tracks {
 		hash, err := fileSHA256(track.Path)
@@ -152,7 +177,7 @@ func ContentHash(tracks []Track) (string, error) {
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return "", apperr.Wrap(apperr.CodeUnexpected, "could not encode multichannel hash input", err)
+		return "", apperr.Wrap(apperr.CodeUnexpected, "could not encode track audio hash input", err)
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:]), nil
@@ -164,18 +189,7 @@ func ffmpegArgs(tracks []Track, outputPath string, outputDuration time.Duration)
 		args = append(args, "-i", track.Path)
 	}
 
-	var parts []string
-	for i, track := range tracks {
-		filters := []string{"aformat=channel_layouts=mono"}
-		if track.Offset < 0 {
-			filters = append(filters, "atrim=start="+formatSecondsDuration(-track.Offset), "asetpts=PTS-STARTPTS")
-		} else if track.Offset > 0 {
-			filters = append(filters, fmt.Sprintf("adelay=%d:all=1", delayMilliseconds(track.Offset)))
-		}
-		filters = append(filters, "apad")
-		parts = append(parts, fmt.Sprintf("[%d:a]%s[a%d]", i, strings.Join(filters, ","), i))
-	}
-
+	parts := ffmpegTrackFilters(tracks)
 	var inputs strings.Builder
 	for i := range tracks {
 		fmt.Fprintf(&inputs, "[a%d]", i)
@@ -190,6 +204,44 @@ func ffmpegArgs(tracks []Track, outputPath string, outputDuration time.Duration)
 		outputPath,
 	)
 	return args
+}
+
+func ffmpegMixdownArgs(tracks []Track, outputPath string, outputDuration time.Duration) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-vn"}
+	for _, track := range tracks {
+		args = append(args, "-i", track.Path)
+	}
+
+	parts := ffmpegTrackFilters(tracks)
+	var inputs strings.Builder
+	for i := range tracks {
+		fmt.Fprintf(&inputs, "[a%d]", i)
+	}
+	parts = append(parts, fmt.Sprintf("%samix=inputs=%d:duration=longest[aout]", inputs.String(), len(tracks)))
+
+	args = append(args,
+		"-filter_complex", strings.Join(parts, ";"),
+		"-map", "[aout]",
+		"-t", formatSecondsDuration(outputDuration),
+		"-c:a", "flac",
+		outputPath,
+	)
+	return args
+}
+
+func ffmpegTrackFilters(tracks []Track) []string {
+	var parts []string
+	for i, track := range tracks {
+		filters := []string{"aformat=channel_layouts=mono"}
+		if track.Offset < 0 {
+			filters = append(filters, "atrim=start="+formatSecondsDuration(-track.Offset), "asetpts=PTS-STARTPTS")
+		} else if track.Offset > 0 {
+			filters = append(filters, fmt.Sprintf("adelay=%d:all=1", delayMilliseconds(track.Offset)))
+		}
+		filters = append(filters, "apad")
+		parts = append(parts, fmt.Sprintf("[%d:a]%s[a%d]", i, strings.Join(filters, ","), i))
+	}
+	return parts
 }
 
 func probeDuration(ctx context.Context, path string) (time.Duration, error) {
@@ -236,9 +288,17 @@ func formatSecondsDuration(d time.Duration) string {
 }
 
 func TempOutputPath() (string, error) {
-	file, err := os.CreateTemp("", "podscribe-multichannel-*.flac")
+	return tempOutputPath("podscribe-multichannel-*.flac")
+}
+
+func TempMixdownOutputPath() (string, error) {
+	return tempOutputPath("podscribe-track-mixdown-*.flac")
+}
+
+func tempOutputPath(pattern string) (string, error) {
+	file, err := os.CreateTemp("", pattern)
 	if err != nil {
-		return "", apperr.Wrap(apperr.CodeFilesystem, "could not create temporary multichannel audio file", err)
+		return "", apperr.Wrap(apperr.CodeFilesystem, "could not create temporary audio file", err)
 	}
 	path := file.Name()
 	if err := file.Close(); err != nil {

@@ -70,6 +70,62 @@ func TestMergeBuildsMultichannelFileWithOffsets(t *testing.T) {
 	}
 }
 
+func TestMixdownBuildsSingleChannelFileWithOffsets(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "ffmpeg-args.txt")
+	installFakeAudioTools(t, dir, argsPath, map[string]string{
+		"emilio.wav": "10.0",
+		"guest.wav":  "10.0",
+	})
+
+	emilio := filepath.Join(dir, "emilio.wav")
+	guest := filepath.Join(dir, "guest.wav")
+	for _, path := range []string{emilio, guest} {
+		if err := os.WriteFile(path, []byte("audio"), 0o644); err != nil {
+			t.Fatalf("write track: %v", err)
+		}
+	}
+
+	output := filepath.Join(dir, "mixed.flac")
+	result, err := Mixdown(context.Background(), Request{
+		Tracks: []Track{
+			{Name: "Emilio", Path: emilio},
+			{Name: "Guest", Path: guest, Offset: 1500 * time.Millisecond},
+		},
+		OutputPath: output,
+	})
+	if err != nil {
+		t.Fatalf("Mixdown() error = %v", err)
+	}
+	if result.Path != output || result.Size == 0 {
+		t.Fatalf("Mixdown() result = %+v, want output path and nonzero size", result)
+	}
+
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg args: %v", err)
+	}
+	args := string(argsBytes)
+	for _, want := range []string{
+		"-i\n" + emilio,
+		"-i\n" + guest,
+		"aformat=channel_layouts=mono,apad",
+		"aformat=channel_layouts=mono,adelay=1500:all=1,apad",
+		"amix=inputs=2:duration=longest",
+		"-map\n[aout]",
+		"-t\n11.5",
+		"-c:a\nflac",
+		output,
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("ffmpeg args missing %q\n%s", want, args)
+		}
+	}
+	if strings.Contains(args, "amerge=inputs=2") {
+		t.Fatalf("ffmpeg args used multichannel merge for mixdown:\n%s", args)
+	}
+}
+
 func TestMergeTrimsNegativeOffsets(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "ffmpeg-args.txt")

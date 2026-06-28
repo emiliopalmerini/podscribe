@@ -7,7 +7,7 @@
 - `internal/config` owns config paths, auth precedence, and base URL resolution.
 - `internal/elevenlabs` owns request construction, streamed multipart upload, API errors, and typed transcript responses.
 - `internal/jobstore` owns local resume/idempotency records, audio/request hashing, and atomic cache writes.
-- `internal/audiomerge` owns `ffprobe` duration inspection and `ffmpeg`-backed multichannel speaker-track merging.
+- `internal/audiomerge` owns `ffprobe` duration inspection and `ffmpeg`-backed speaker-track multichannel merging or mixdown.
 - `internal/audioclip` owns `ffmpeg`-backed local audio segment extraction.
 - `internal/locate` maps selected transcript fragments back to cached word-level timings.
 - `internal/render` turns ElevenLabs word timing into editable Markdown transcript blocks.
@@ -15,7 +15,7 @@
 
 The transcription upload uses `io.Pipe` with `multipart.Writer` so long podcast files are streamed to the HTTP request instead of buffered in memory. The ElevenLabs client reports file-byte progress through a callback, and the CLI renders that progress only on stderr so JSON stdout remains parseable.
 
-Speaker-track transcription is a pre-upload transform. The CLI hashes the ordered source track contents and offsets for cache identity, then uses `ffprobe` and `ffmpeg` to create a temporary multichannel FLAC only when a cache miss needs a new ElevenLabs upload. Track names stay local render metadata; they are not part of the remote request hash.
+Speaker-track transcription is a pre-upload transform. The CLI hashes the ordered source track contents and offsets for cache identity, then uses `ffprobe` and `ffmpeg` to create a temporary FLAC only when a cache miss needs a new ElevenLabs upload. Default track mode preserves each file as a separate channel and sends ElevenLabs multichannel fields. `--track-mixdown` instead mixes the tracks into one normal audio upload and uses track names as default diarization speaker names. Track names stay local render metadata; they are not part of the remote request hash.
 
 Resume and idempotency are client-side. Before a transcription upload, the CLI resolves the ElevenLabs `user_id`, hashes the audio file and remote request options, and looks up `~/.podscribe/jobs/v1/<job-key>.json`. Completed jobs are rendered from cached raw JSON. Pending or submitted jobs block automatic resubmission unless `--force` is set, because ElevenLabs does not expose historical partial batch transcripts and a previous upload may already have been accepted.
 
