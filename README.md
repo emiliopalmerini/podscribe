@@ -79,6 +79,26 @@ podscribe transcribe episode.mp3 --speaker-names-file speakers.txt
 
 `speakers.txt` uses one name per line. Blank lines and lines starting with `#` are ignored. Speaker names imply diarization; when `--speakers` is omitted, podscribe sends the number of supplied names as the speaker count.
 
+If each podcast speaker is recorded to a separate file that starts from the same timeline, merge those files into one ElevenLabs multichannel upload with repeated `--track` flags:
+
+```bash
+podscribe transcribe \
+  --track "Emilio=emilio.wav" \
+  --track "Guest=guest.wav" \
+  --out episode.transcript.md
+```
+
+Track names become channel labels in the transcript. Use `--track-offset` when a file starts late or early:
+
+```bash
+podscribe transcribe \
+  --track "Emilio=emilio.wav" \
+  --track "Guest=guest.wav" \
+  --track-offset "Guest=1.42s"
+```
+
+Positive offsets add leading silence; negative offsets trim from the start. Track mode requires `ffmpeg` and `ffprobe`, supports two to five tracks, and uploads a temporary multichannel FLAC with ElevenLabs `use_multi_channel=true` and `multichannel_output_style=combined`.
+
 Save the raw ElevenLabs JSON alongside the Markdown:
 
 ```bash

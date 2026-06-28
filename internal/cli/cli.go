@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/audioclip"
+	"github.com/emiliopalmerini/podscribe/internal/audiomerge"
 	"github.com/emiliopalmerini/podscribe/internal/config"
 	"github.com/emiliopalmerini/podscribe/internal/elevenlabs"
 	"github.com/emiliopalmerini/podscribe/internal/jobstore"
@@ -200,16 +202,26 @@ func printDoctor(w io.Writer, data map[string]any) {
 func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 	var flags transcribeFlags
 	cmd := &cobra.Command{
-		Use:   "transcribe <audio-file>",
-		Short: "Transcribe a local podcast audio file",
+		Use:   "transcribe <audio-file>|--track <name=audio-file>",
+		Short: "Transcribe local podcast audio",
 		Args: func(cmd *cobra.Command, args []string) error {
+			if len(flags.tracks) > 0 {
+				if len(args) != 0 {
+					return apperr.New(apperr.CodeInvalidInput, "do not provide an audio file when using --track")
+				}
+				return nil
+			}
 			if len(args) != 1 {
 				return apperr.New(apperr.CodeInvalidInput, "provide exactly one audio file")
 			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTranscribe(ctx, opts, flags, args[0])
+			audioPath := ""
+			if len(args) > 0 {
+				audioPath = args[0]
+			}
+			return runTranscribe(ctx, opts, flags, audioPath)
 		},
 	}
 	cmd.Flags().StringVar(&flags.model, "model", "scribe_v2", "ElevenLabs speech-to-text model")
@@ -220,6 +232,8 @@ func newTranscribeCommand(ctx context.Context, opts *rootOptions) *cobra.Command
 	cmd.Flags().StringVar(&flags.speakerNamesFile, "speaker-names-file", "", "file with one speaker display name per line")
 	cmd.Flags().StringArrayVar(&flags.keyterms, "keyterm", nil, "custom vocabulary term; repeatable")
 	cmd.Flags().StringVar(&flags.keytermsFile, "keyterms-file", "", "file with one keyterm per line")
+	cmd.Flags().StringArrayVar(&flags.tracks, "track", nil, "speaker track as name=audio-file; repeatable for multichannel upload")
+	cmd.Flags().StringArrayVar(&flags.trackOffsets, "track-offset", nil, "speaker track offset as name=duration, for example Guest=1.42s or Guest=-500ms")
 	cmd.Flags().BoolVar(&flags.clean, "clean", false, "remove fillers and non-speech artifacts where supported")
 	cmd.Flags().BoolVar(&flags.noAudioEvents, "no-audio-events", false, "disable audio event tags such as laughter")
 	cmd.Flags().BoolVar(&flags.timestamps, "timestamps", false, "include timestamps in Markdown transcript blocks")
@@ -240,6 +254,8 @@ type transcribeFlags struct {
 	speakerNamesFile string
 	keyterms         []string
 	keytermsFile     string
+	tracks           []string
+	trackOffsets     []string
 	clean            bool
 	noAudioEvents    bool
 	timestamps       bool
@@ -250,11 +266,21 @@ type transcribeFlags struct {
 	webhookID        string
 }
 
+type transcribeInput struct {
+	SourcePath        string
+	SourceLabel       string
+	RenderSourceFile  string
+	TitleSourcePath   string
+	DefaultOutputPath string
+	UploadPath        string
+	UploadSize        int64
+	AudioHash         string
+	MultiChannel      bool
+	Tracks            []audiomerge.Track
+	SpeakerNames      []string
+}
+
 func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags, audioPath string) error {
-	audioSize, err := validateAudioPath(audioPath)
-	if err != nil {
-		return err
-	}
 	if err := validateTranscribeFlags(flags); err != nil {
 		return err
 	}
@@ -265,21 +291,23 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 	if err := validateKeyterms(keyterms); err != nil {
 		return err
 	}
-	speakerNames, err := collectSpeakerNames(flags.speakerNames, flags.speakerNamesFile)
+	input, err := resolveTranscribeInput(flags, audioPath)
 	if err != nil {
 		return err
 	}
-	if err := validateSpeakerNames(speakerNames, flags.speakers); err != nil {
-		return err
-	}
+	speakerNames := input.SpeakerNames
 	speakers := flags.speakers
-	if speakers == 0 && len(speakerNames) > 0 {
+	diarize := flags.diarize || speakers > 0 || len(speakerNames) > 0
+	if input.MultiChannel {
+		speakers = 0
+		diarize = false
+	} else if speakers == 0 && len(speakerNames) > 0 {
 		speakers = len(speakerNames)
 	}
 
 	outPath := flags.out
 	if outPath == "" {
-		outPath = defaultTranscriptPath(audioPath)
+		outPath = input.DefaultOutputPath
 	}
 	if err := ensureWritableTarget(outPath, flags.force); err != nil {
 		return err
@@ -295,7 +323,6 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		return err
 	}
 	client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
-	diarize := flags.diarize || speakers > 0 || len(speakerNames) > 0
 	accountNamespace, namespaceSource, err := resolveAccountNamespace(ctx, client, rt.APIKey)
 	if err != nil {
 		return err
@@ -304,11 +331,8 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		fmt.Fprintln(opts.errOut, "Warning: could not resolve ElevenLabs user_id; using API-key hash namespace for cache.")
 	}
 
-	audioHash, err := jobstore.FileSHA256(audioPath)
-	if err != nil {
-		return err
-	}
-	remoteReq := buildRemoteRequest(flags, keyterms, diarize, speakers)
+	audioHash := input.AudioHash
+	remoteReq := buildRemoteRequest(flags, keyterms, diarize, speakers, input.MultiChannel)
 	requestHash, err := jobstore.RequestHash(remoteReq)
 	if err != nil {
 		return err
@@ -321,7 +345,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 	if err != nil {
 		return err
 	}
-	renderReq := buildRenderRequest(audioPath, flags, diarize, speakerNames)
+	renderReq := buildRenderRequest(input.TitleSourcePath, input.RenderSourceFile, flags, diarize || input.MultiChannel, speakerNames)
 
 	if record, found, err := jobstore.Load(jobKey); err != nil {
 		return err
@@ -332,7 +356,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 			if err != nil {
 				return err
 			}
-			return writeTranscriptOutputs(opts, flags, audioPath, outPath, transcript, raw, renderReq, transcribeOutputMeta{
+			return writeTranscriptOutputs(opts, flags, input.SourceLabel, outPath, transcript, raw, renderReq, transcribeOutputMeta{
 				JobKey:                 jobKey,
 				AccountNamespace:       accountNamespace,
 				AccountNamespaceSource: namespaceSource,
@@ -345,14 +369,37 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		}
 	}
 
-	record := newJobRecord(jobKey, accountNamespace, rt.BaseURL, audioHash, requestHash, remoteReq, renderReq, audioPath, outPath, flags.rawOut)
+	uploadPath := input.UploadPath
+	audioSize := input.UploadSize
+	if input.MultiChannel {
+		if !opts.json {
+			writeTrackMap(opts.errOut, input.Tracks)
+			fmt.Fprintln(opts.errOut, "Merging tracks into temporary multichannel audio...")
+		}
+		tempPath, err := audiomerge.TempOutputPath()
+		if err != nil {
+			return err
+		}
+		defer os.Remove(tempPath)
+		mergeResult, err := audiomerge.Merge(ctx, audiomerge.Request{Tracks: input.Tracks, OutputPath: tempPath})
+		if err != nil {
+			return err
+		}
+		uploadPath = mergeResult.Path
+		audioSize = mergeResult.Size
+		if !opts.json {
+			fmt.Fprintf(opts.errOut, "Merged %d tracks into %s (%s).\n", len(input.Tracks), uploadPath, formatBytes(audioSize))
+		}
+	}
+
+	record := newJobRecord(jobKey, accountNamespace, rt.BaseURL, audioHash, requestHash, remoteReq, renderReq, input.SourcePath, outPath, flags.rawOut, jobstoreInputTracks(input.Tracks))
 	cachePath, err = jobstore.Save(record)
 	if err != nil {
 		return err
 	}
 
 	transcribeOpts := elevenlabs.TranscribeOptions{
-		FilePath:              audioPath,
+		FilePath:              uploadPath,
 		Model:                 flags.model,
 		Language:              flags.language,
 		Diarize:               diarize,
@@ -361,6 +408,10 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		Clean:                 flags.clean,
 		TagAudioEvents:        !flags.noAudioEvents,
 		TimestampsGranularity: "word",
+		UseMultiChannel:       input.MultiChannel,
+	}
+	if input.MultiChannel {
+		transcribeOpts.MultichannelOutputStyle = "combined"
 	}
 
 	if flags.webhook {
@@ -381,7 +432,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 
 	var progress *transcribeProgressPrinter
 	if !opts.json {
-		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs...\n", audioPath, formatBytes(audioSize))
+		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs...\n", uploadPath, formatBytes(audioSize))
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
 	transcribeOpts.OnUploadProgress = progressCallback(progress)
@@ -405,7 +456,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 	if err != nil {
 		return err
 	}
-	return writeTranscriptOutputs(opts, flags, audioPath, outPath, transcript, raw, renderReq, transcribeOutputMeta{
+	return writeTranscriptOutputs(opts, flags, input.SourceLabel, outPath, transcript, raw, renderReq, transcribeOutputMeta{
 		JobKey:                 jobKey,
 		AccountNamespace:       accountNamespace,
 		AccountNamespaceSource: namespaceSource,
@@ -438,24 +489,80 @@ func resolveAccountNamespace(ctx context.Context, client *elevenlabs.Client, api
 	return jobstore.APIKeyNamespace(apiKey), "api_key_hash", nil
 }
 
-func buildRemoteRequest(flags transcribeFlags, keyterms []string, diarize bool, speakers int) jobstore.RemoteRequest {
+func resolveTranscribeInput(flags transcribeFlags, audioPath string) (transcribeInput, error) {
+	if len(flags.tracks) == 0 {
+		audioSize, err := validateAudioPath(audioPath)
+		if err != nil {
+			return transcribeInput{}, err
+		}
+		speakerNames, err := collectSpeakerNames(flags.speakerNames, flags.speakerNamesFile)
+		if err != nil {
+			return transcribeInput{}, err
+		}
+		if err := validateSpeakerNames(speakerNames, flags.speakers); err != nil {
+			return transcribeInput{}, err
+		}
+		audioHash, err := jobstore.FileSHA256(audioPath)
+		if err != nil {
+			return transcribeInput{}, err
+		}
+		return transcribeInput{
+			SourcePath:        audioPath,
+			SourceLabel:       audioPath,
+			RenderSourceFile:  filepath.Base(audioPath),
+			TitleSourcePath:   audioPath,
+			DefaultOutputPath: defaultTranscriptPath(audioPath),
+			UploadPath:        audioPath,
+			UploadSize:        audioSize,
+			AudioHash:         audioHash,
+			SpeakerNames:      speakerNames,
+		}, nil
+	}
+
+	tracks, err := collectTracks(flags.tracks, flags.trackOffsets)
+	if err != nil {
+		return transcribeInput{}, err
+	}
+	audioHash, err := audiomerge.ContentHash(tracks)
+	if err != nil {
+		return transcribeInput{}, err
+	}
+	return transcribeInput{
+		SourceLabel:       trackSourceLabel(tracks),
+		RenderSourceFile:  trackSourceLabel(tracks),
+		TitleSourcePath:   tracks[0].Path,
+		DefaultOutputPath: defaultTranscriptPath(tracks[0].Path),
+		AudioHash:         audioHash,
+		MultiChannel:      true,
+		Tracks:            tracks,
+		SpeakerNames:      trackNames(tracks),
+	}, nil
+}
+
+func buildRemoteRequest(flags transcribeFlags, keyterms []string, diarize bool, speakers int, multiChannel bool) jobstore.RemoteRequest {
+	style := ""
+	if multiChannel {
+		style = "combined"
+	}
 	return jobstore.RemoteRequest{
-		Model:                 flags.model,
-		Language:              strings.TrimSpace(flags.language),
-		Diarize:               diarize,
-		Speakers:              speakers,
-		Keyterms:              append([]string(nil), keyterms...),
-		Clean:                 flags.clean,
-		TagAudioEvents:        !flags.noAudioEvents,
-		TimestampsGranularity: "word",
+		Model:                   flags.model,
+		Language:                strings.TrimSpace(flags.language),
+		Diarize:                 diarize,
+		Speakers:                speakers,
+		Keyterms:                append([]string(nil), keyterms...),
+		Clean:                   flags.clean,
+		TagAudioEvents:          !flags.noAudioEvents,
+		TimestampsGranularity:   "word",
+		UseMultiChannel:         multiChannel,
+		MultichannelOutputStyle: style,
 	}
 }
 
-func buildRenderRequest(audioPath string, flags transcribeFlags, diarize bool, speakerNames []string) jobstore.RenderRequest {
-	title := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
+func buildRenderRequest(titleSourcePath, sourceFile string, flags transcribeFlags, diarize bool, speakerNames []string) jobstore.RenderRequest {
+	title := strings.TrimSuffix(filepath.Base(titleSourcePath), filepath.Ext(titleSourcePath))
 	return jobstore.RenderRequest{
 		Title:        title,
-		SourceFile:   filepath.Base(audioPath),
+		SourceFile:   sourceFile,
 		Model:        flags.model,
 		Diarized:     diarize,
 		Timestamps:   flags.timestamps,
@@ -463,7 +570,7 @@ func buildRenderRequest(audioPath string, flags transcribeFlags, diarize bool, s
 	}
 }
 
-func newJobRecord(jobKey, accountNamespace, baseURL, audioHash, requestHash string, remoteReq jobstore.RemoteRequest, renderReq jobstore.RenderRequest, sourcePath, outPath, rawOutPath string) jobstore.Record {
+func newJobRecord(jobKey, accountNamespace, baseURL, audioHash, requestHash string, remoteReq jobstore.RemoteRequest, renderReq jobstore.RenderRequest, sourcePath, outPath, rawOutPath string, inputTracks []jobstore.InputTrack) jobstore.Record {
 	now := time.Now().UTC()
 	return jobstore.Record{
 		SchemaVersion:    jobstore.SchemaVersion,
@@ -478,8 +585,109 @@ func newJobRecord(jobKey, accountNamespace, baseURL, audioHash, requestHash stri
 		SourcePath:       sourcePath,
 		OutputPath:       outPath,
 		RawOutputPath:    rawOutPath,
+		InputTracks:      inputTracks,
 		CreatedAt:        now,
 		UpdatedAt:        now,
+	}
+}
+
+func collectTracks(trackSpecs, offsetSpecs []string) ([]audiomerge.Track, error) {
+	tracks := make([]audiomerge.Track, 0, len(trackSpecs))
+	for _, spec := range trackSpecs {
+		name, path, ok := strings.Cut(spec, "=")
+		if !ok {
+			return nil, apperr.New(apperr.CodeInvalidInput, "--track must use name=audio-file")
+		}
+		tracks = append(tracks, audiomerge.Track{Name: strings.TrimSpace(name), Path: strings.TrimSpace(path)})
+	}
+
+	offsets := map[string]time.Duration{}
+	for _, spec := range offsetSpecs {
+		name, raw, ok := strings.Cut(spec, "=")
+		if !ok {
+			return nil, apperr.New(apperr.CodeInvalidInput, "--track-offset must use name=duration")
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, apperr.New(apperr.CodeInvalidInput, "--track-offset speaker name cannot be empty")
+		}
+		if _, exists := offsets[name]; exists {
+			return nil, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("duplicate --track-offset for %q", name))
+		}
+		offset, err := parseTrackOffset(raw)
+		if err != nil {
+			return nil, err
+		}
+		offsets[name] = offset
+	}
+
+	seen := map[string]struct{}{}
+	for i := range tracks {
+		if _, ok := seen[tracks[i].Name]; ok {
+			return nil, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("duplicate --track speaker name %q", tracks[i].Name))
+		}
+		seen[tracks[i].Name] = struct{}{}
+		if offset, ok := offsets[tracks[i].Name]; ok {
+			tracks[i].Offset = offset
+			delete(offsets, tracks[i].Name)
+		}
+	}
+	for name := range offsets {
+		return nil, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("--track-offset references unknown track %q", name))
+	}
+	return audiomerge.ValidateTracks(tracks)
+}
+
+func parseTrackOffset(raw string) (time.Duration, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, apperr.New(apperr.CodeInvalidInput, "--track-offset duration cannot be empty")
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d, nil
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, apperr.New(apperr.CodeInvalidInput, fmt.Sprintf("invalid --track-offset duration %q", raw))
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+func trackNames(tracks []audiomerge.Track) []string {
+	names := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		names = append(names, track.Name)
+	}
+	return names
+}
+
+func trackSourceLabel(tracks []audiomerge.Track) string {
+	parts := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		parts = append(parts, track.Name+"="+track.Path)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func jobstoreInputTracks(tracks []audiomerge.Track) []jobstore.InputTrack {
+	if len(tracks) == 0 {
+		return nil
+	}
+	out := make([]jobstore.InputTrack, 0, len(tracks))
+	for _, track := range tracks {
+		out = append(out, jobstore.InputTrack{
+			Name:        track.Name,
+			Path:        track.Path,
+			OffsetNanos: int64(track.Offset),
+		})
+	}
+	return out
+}
+
+func writeTrackMap(w io.Writer, tracks []audiomerge.Track) {
+	fmt.Fprintln(w, "Multichannel track map:")
+	for i, track := range tracks {
+		fmt.Fprintf(w, "Channel %d: %s  %s  offset %s\n", i, track.Name, track.Path, track.Offset.String())
 	}
 }
 
@@ -1058,6 +1266,20 @@ func validateTranscribeFlags(flags transcribeFlags) error {
 	case "scribe_v2", "scribe_v1":
 	default:
 		return apperr.New(apperr.CodeInvalidInput, "--model must be scribe_v2 or scribe_v1")
+	}
+	if len(flags.trackOffsets) > 0 && len(flags.tracks) == 0 {
+		return apperr.New(apperr.CodeInvalidInput, "--track-offset requires --track")
+	}
+	if len(flags.tracks) > 0 {
+		if flags.diarize {
+			return apperr.New(apperr.CodeInvalidInput, "--diarize cannot be used with --track")
+		}
+		if flags.speakers > 0 {
+			return apperr.New(apperr.CodeInvalidInput, "--speakers cannot be used with --track")
+		}
+		if len(flags.speakerNames) > 0 || flags.speakerNamesFile != "" {
+			return apperr.New(apperr.CodeInvalidInput, "--speaker-name and --speaker-names-file cannot be used with --track; use the --track names instead")
+		}
 	}
 	if flags.speakers < 0 || flags.speakers > 32 {
 		return apperr.New(apperr.CodeInvalidInput, "--speakers must be between 1 and 32")

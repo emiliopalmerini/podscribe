@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emiliopalmerini/podscribe/internal/jobstore"
 )
@@ -442,6 +444,158 @@ func TestTranscribeSpeakerNamesFileAndFlagsAppendInOrder(t *testing.T) {
 	}
 	if got := strings.Join(fields["num_speakers"], "|"); got != "3" {
 		t.Fatalf("num_speakers fields = %q, want 3", got)
+	}
+}
+
+func TestTranscribeTracksMergesAndUploadsMultichannelAudio(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ELEVENLABS_API_KEY", "")
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "ffmpeg-args.txt")
+	installFakeMergeTools(t, dir, argsPath)
+	emilio := filepath.Join(dir, "emilio.wav")
+	guest := filepath.Join(dir, "guest.wav")
+	for _, path := range []string{emilio, guest} {
+		if err := os.WriteFile(path, []byte("track audio"), 0o644); err != nil {
+			t.Fatalf("write track: %v", err)
+		}
+	}
+
+	var fields map[string][]string
+	var uploaded string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/user" {
+			_, _ = w.Write([]byte(`{"user_id":"user_test","seat_type":"workspace_admin","created_at":1}`))
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/speech-to-text" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		fields = map[string][]string{}
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("read multipart part: %v", err)
+			}
+			if part.FormName() == "file" {
+				uploaded = string(b)
+				continue
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(b))
+		}
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello. Thanks!","words":[{"text":"Hello.","start":1.0,"end":1.2,"type":"word","channel_index":0},{"text":"Thanks!","start":1.5,"end":1.8,"type":"word","channel_index":1}],"transcription_id":"tx_123"}`))
+	}))
+	defer server.Close()
+
+	outPath := filepath.Join(dir, "episode.md")
+	var stdout, stderr bytes.Buffer
+	err := Execute(context.Background(), []string{
+		"--api-key", "test-key",
+		"--base-url", server.URL,
+		"transcribe",
+		"--track", "Emilio=" + emilio,
+		"--track", "Guest=" + guest,
+		"--track-offset", "Guest=1.5s",
+		"--out", outPath,
+	}, strings.NewReader(""), &stdout, &stderr, "test")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	if uploaded != "merged audio" {
+		t.Fatalf("uploaded file content = %q, want merged audio", uploaded)
+	}
+	if got := strings.Join(fields["use_multi_channel"], "|"); got != "true" {
+		t.Fatalf("use_multi_channel fields = %q, want true", got)
+	}
+	if got := strings.Join(fields["multichannel_output_style"], "|"); got != "combined" {
+		t.Fatalf("multichannel_output_style fields = %q, want combined", got)
+	}
+	if got := strings.Join(fields["diarize"], "|"); got != "" {
+		t.Fatalf("diarize fields = %q, want unset for multichannel tracks", got)
+	}
+
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg args: %v", err)
+	}
+	if !strings.Contains(string(argsBytes), "adelay=1500:all=1") {
+		t.Fatalf("ffmpeg args missing offset delay:\n%s", string(argsBytes))
+	}
+
+	md, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	for _, want := range []string{
+		"Emilio: Hello.",
+		"Guest: Thanks!",
+	} {
+		if !strings.Contains(string(md), want) {
+			t.Fatalf("transcript missing %q:\n%s", want, string(md))
+		}
+	}
+	for _, want := range []string{
+		"Channel 0: Emilio",
+		"Channel 1: Guest",
+		"offset 1.5s",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+
+	entries, err := jobstore.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("job cache entries = %d, want 1", len(entries))
+	}
+	record := entries[0].Record
+	if record.SourcePath != "" {
+		t.Fatalf("multichannel SourcePath = %q, want empty because merged temp audio is not durable", record.SourcePath)
+	}
+	if len(record.InputTracks) != 2 || record.InputTracks[1].Name != "Guest" || record.InputTracks[1].OffsetNanos != int64(1500*time.Millisecond) {
+		t.Fatalf("input tracks = %+v, want stored track metadata", record.InputTracks)
+	}
+}
+
+func TestCollectTracksParsesOffsets(t *testing.T) {
+	dir := t.TempDir()
+	host := filepath.Join(dir, "host.wav")
+	guest := filepath.Join(dir, "guest.wav")
+	for _, path := range []string{host, guest} {
+		if err := os.WriteFile(path, []byte("track audio"), 0o644); err != nil {
+			t.Fatalf("write track: %v", err)
+		}
+	}
+
+	tracks, err := collectTracks(
+		[]string{"Host=" + host, "Guest=" + guest},
+		[]string{"Guest=1.25", "Host=-500ms"},
+	)
+	if err != nil {
+		t.Fatalf("collectTracks() error = %v", err)
+	}
+	if tracks[0].Offset.String() != "-500ms" || tracks[1].Offset.String() != "1.25s" {
+		t.Fatalf("offsets = %s, %s; want -500ms and 1.25s", tracks[0].Offset, tracks[1].Offset)
+	}
+
+	if _, err := collectTracks([]string{"Host=" + host}, []string{"Guest=1s"}); err == nil {
+		t.Fatal("collectTracks() error = nil, want unknown track offset error")
 	}
 }
 
@@ -1026,6 +1180,40 @@ done
 printf clip > "$last"
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func installFakeMergeTools(t *testing.T, dir, argsPath string) {
+	t.Helper()
+	ffprobe := filepath.Join(dir, "ffprobe")
+	ffprobeScript := `#!/bin/sh
+last=
+for arg do
+  last="$arg"
+done
+case "$last" in
+  *emilio.wav) printf '10.0\n' ;;
+  *guest.wav) printf '10.0\n' ;;
+  *) printf '1.0\n' ;;
+esac
+`
+	if err := os.WriteFile(ffprobe, []byte(ffprobeScript), 0o755); err != nil {
+		t.Fatalf("write fake ffprobe: %v", err)
+	}
+
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	ffmpegScript := fmt.Sprintf(`#!/bin/sh
+: > %q
+last=
+for arg do
+  printf '%%s\n' "$arg" >> %q
+  last="$arg"
+done
+printf 'merged audio' > "$last"
+`, argsPath, argsPath)
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
 	t.Setenv("PATH", dir)

@@ -205,6 +205,40 @@ func TestMarkdownKeepsSpeakerLabelsStableAcrossChunks(t *testing.T) {
 	}
 }
 
+func TestMarkdownRendersCombinedMultichannelWordsWithTrackNames(t *testing.T) {
+	start0, end0 := 1.0, 1.2
+	start1, end1 := 1.5, 1.8
+	start2, end2 := 3.0, 3.2
+	channel0, channel1 := 0, 1
+
+	got := Markdown(elevenlabs.TranscriptResponse{
+		LanguageCode:    "en",
+		TranscriptionID: "tx_123",
+		Words: []elevenlabs.Word{
+			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, ChannelIndex: &channel0},
+			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, ChannelIndex: &channel1},
+			{Text: "Again.", Type: "word", Start: &start2, End: &end2, ChannelIndex: &channel0},
+		},
+	}, MarkdownOptions{
+		Title:        "Episode 1",
+		SourceFile:   "episode.flac",
+		Model:        "scribe_v2",
+		GeneratedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		SpeakerNames: []string{"Emilio", "Guest"},
+	})
+
+	for _, want := range []string{
+		"diarized: true",
+		"Emilio: Hello.",
+		"Guest: Thanks!",
+		"Emilio: Again.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Markdown() missing %q\n%s", want, got)
+		}
+	}
+}
+
 func TestMarkdownFallsBackToPlainText(t *testing.T) {
 	got := Markdown(elevenlabs.TranscriptResponse{
 		LanguageCode: "en",

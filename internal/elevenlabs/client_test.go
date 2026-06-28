@@ -114,6 +114,63 @@ func TestTranscribeFileStreamsMultipartRequest(t *testing.T) {
 	}
 }
 
+func TestTranscribeFileSendsMultichannelFields(t *testing.T) {
+	audio := t.TempDir() + "/episode.flac"
+	if err := osWriteFile(audio, []byte("fake multichannel audio")); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var fields map[string][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Fatalf("MultipartReader() error = %v", err)
+		}
+		fields = map[string][]string{}
+		var sawFile bool
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("NextPart() error = %v", err)
+			}
+			b, err := io.ReadAll(part)
+			if err != nil {
+				t.Fatalf("ReadAll(part) error = %v", err)
+			}
+			if part.FormName() == "file" {
+				sawFile = true
+				continue
+			}
+			fields[part.FormName()] = append(fields[part.FormName()], string(b))
+		}
+		if !sawFile {
+			t.Fatal("multipart request did not include file")
+		}
+		_, _ = w.Write([]byte(`{"language_code":"en","text":"Hello","words":[],"transcription_id":"tx_123"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	client.HTTPClient = server.Client()
+
+	_, _, err := client.TranscribeFile(context.Background(), TranscribeOptions{
+		FilePath:                audio,
+		Model:                   "scribe_v2",
+		TagAudioEvents:          true,
+		TimestampsGranularity:   "word",
+		UseMultiChannel:         true,
+		MultichannelOutputStyle: "combined",
+	})
+	if err != nil {
+		t.Fatalf("TranscribeFile() error = %v", err)
+	}
+	assertField(t, fields, "use_multi_channel", "true")
+	assertField(t, fields, "multichannel_output_style", "combined")
+}
+
 func TestGetDeleteAndRawGET(t *testing.T) {
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

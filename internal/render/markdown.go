@@ -44,7 +44,7 @@ func Markdown(resp elevenlabs.TranscriptResponse, opts MarkdownOptions) string {
 	fmt.Fprintf(&b, "## Transcript\n\n")
 
 	chunks := resp.Chunks()
-	diarized := opts.Diarized || hasSpeakers(chunks)
+	diarized := opts.Diarized || hasSpeakers(chunks) || hasChannels(chunks)
 	labels := speakerLabels(chunks, opts.SpeakerNames)
 	for i, chunk := range chunks {
 		if len(chunks) > 1 {
@@ -84,7 +84,7 @@ func writeFrontMatter(b *strings.Builder, resp elevenlabs.TranscriptResponse, op
 		fmt.Fprintf(b, "audio_duration_secs: %s\n", strconv.FormatFloat(*duration, 'f', -1, 64))
 	}
 	yamlString(b, "transcription_id", transcriptionID)
-	fmt.Fprintf(b, "diarized: %t\n", opts.Diarized || hasSpeakers(chunks))
+	fmt.Fprintf(b, "diarized: %t\n", opts.Diarized || hasSpeakers(chunks) || hasChannels(chunks))
 	yamlString(b, "generated_at", opts.GeneratedAt.UTC().Format(time.RFC3339))
 	fmt.Fprintln(b, "---")
 	fmt.Fprintln(b)
@@ -150,7 +150,7 @@ func groupWords(words []elevenlabs.Word) []block {
 
 		startsNew := text.Len() == 0
 		if !startsNew && word.Type != "spacing" {
-			if current.Speaker != "" && word.SpeakerID != "" && current.Speaker != word.SpeakerID {
+			if key := wordSpeakerKey(word); current.Speaker != "" && key != "" && current.Speaker != key {
 				startsNew = true
 			}
 			if lastEnd != nil && word.Start != nil && *word.Start-*lastEnd > silenceGapSeconds {
@@ -169,7 +169,7 @@ func groupWords(words []elevenlabs.Word) []block {
 		}
 		if text.Len() == 0 {
 			current.Start = word.Start
-			current.Speaker = word.SpeakerID
+			current.Speaker = wordSpeakerKey(word)
 		}
 		appendToken(&text, word.Text, word.Type)
 		if word.End != nil {
@@ -224,23 +224,32 @@ func speakerLabels(chunks []elevenlabs.TranscriptChunk, names []string) map[stri
 	labels := make(map[string]string)
 	for _, chunk := range chunks {
 		for _, word := range chunk.Words {
-			if word.SpeakerID == "" {
+			key := wordSpeakerKey(word)
+			if key == "" {
 				continue
 			}
-			if _, ok := labels[word.SpeakerID]; ok {
+			if _, ok := labels[key]; ok {
+				continue
+			}
+			if word.ChannelIndex != nil {
+				if *word.ChannelIndex >= 0 && *word.ChannelIndex < len(names) {
+					labels[key] = names[*word.ChannelIndex]
+				} else {
+					labels[key] = fmt.Sprintf("Channel %d", *word.ChannelIndex)
+				}
 				continue
 			}
 			if len(labels) < len(names) {
-				labels[word.SpeakerID] = names[len(labels)]
+				labels[key] = names[len(labels)]
 				continue
 			}
 			switch strings.ToLower(word.SpeakerID) {
 			case "agent":
-				labels[word.SpeakerID] = "Agent"
+				labels[key] = "Agent"
 			case "customer":
-				labels[word.SpeakerID] = "Customer"
+				labels[key] = "Customer"
 			default:
-				labels[word.SpeakerID] = fmt.Sprintf("Speaker %d", len(labels)+1)
+				labels[key] = fmt.Sprintf("Speaker %d", len(labels)+1)
 			}
 		}
 	}
@@ -256,6 +265,30 @@ func hasSpeakers(chunks []elevenlabs.TranscriptChunk) bool {
 		}
 	}
 	return false
+}
+
+func hasChannels(chunks []elevenlabs.TranscriptChunk) bool {
+	for _, chunk := range chunks {
+		if chunk.ChannelIndex != nil {
+			return true
+		}
+		for _, word := range chunk.Words {
+			if word.ChannelIndex != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func wordSpeakerKey(word elevenlabs.Word) string {
+	if word.SpeakerID != "" {
+		return word.SpeakerID
+	}
+	if word.ChannelIndex != nil {
+		return fmt.Sprintf("channel:%d", *word.ChannelIndex)
+	}
+	return ""
 }
 
 func formatTimestamp(seconds *float64) string {

@@ -37,19 +37,21 @@ type Client struct {
 }
 
 type TranscribeOptions struct {
-	FilePath              string
-	Model                 string
-	Language              string
-	Diarize               bool
-	Speakers              int
-	Keyterms              []string
-	Clean                 bool
-	TagAudioEvents        bool
-	TimestampsGranularity string
-	Webhook               bool
-	WebhookID             string
-	WebhookMetadata       map[string]any
-	OnUploadProgress      func(UploadProgress)
+	FilePath                string
+	Model                   string
+	Language                string
+	Diarize                 bool
+	Speakers                int
+	Keyterms                []string
+	Clean                   bool
+	TagAudioEvents          bool
+	TimestampsGranularity   string
+	UseMultiChannel         bool
+	MultichannelOutputStyle string
+	Webhook                 bool
+	WebhookID               string
+	WebhookMetadata         map[string]any
+	OnUploadProgress        func(UploadProgress)
 }
 
 type formField struct {
@@ -247,6 +249,12 @@ func writeTranscribeMultipart(writer *multipart.Writer, opts TranscribeOptions, 
 	fields := []formField{
 		{name: "model_id", value: opts.Model},
 		{name: "timestamps_granularity", value: opts.TimestampsGranularity},
+	}
+	if opts.UseMultiChannel {
+		fields = append(fields, formField{name: "use_multi_channel", value: "true"})
+		if opts.MultichannelOutputStyle != "" {
+			fields = append(fields, formField{name: "multichannel_output_style", value: opts.MultichannelOutputStyle})
+		}
 	}
 	if opts.Language != "" {
 		fields = append(fields, formField{name: "language_code", value: opts.Language})

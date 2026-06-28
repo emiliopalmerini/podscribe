@@ -25,14 +25,16 @@ const (
 )
 
 type RemoteRequest struct {
-	Model                 string   `json:"model"`
-	Language              string   `json:"language,omitempty"`
-	Diarize               bool     `json:"diarize"`
-	Speakers              int      `json:"speakers,omitempty"`
-	Keyterms              []string `json:"keyterms,omitempty"`
-	Clean                 bool     `json:"clean"`
-	TagAudioEvents        bool     `json:"tag_audio_events"`
-	TimestampsGranularity string   `json:"timestamps_granularity"`
+	Model                   string   `json:"model"`
+	Language                string   `json:"language,omitempty"`
+	Diarize                 bool     `json:"diarize"`
+	Speakers                int      `json:"speakers,omitempty"`
+	Keyterms                []string `json:"keyterms,omitempty"`
+	Clean                   bool     `json:"clean"`
+	TagAudioEvents          bool     `json:"tag_audio_events"`
+	TimestampsGranularity   string   `json:"timestamps_granularity"`
+	UseMultiChannel         bool     `json:"use_multi_channel,omitempty"`
+	MultichannelOutputStyle string   `json:"multichannel_output_style,omitempty"`
 }
 
 type RenderRequest struct {
@@ -57,6 +59,7 @@ type Record struct {
 	SourcePath       string          `json:"source_path,omitempty"`
 	OutputPath       string          `json:"output_path,omitempty"`
 	RawOutputPath    string          `json:"raw_output_path,omitempty"`
+	InputTracks      []InputTrack    `json:"input_tracks,omitempty"`
 	TranscriptionID  string          `json:"transcription_id,omitempty"`
 	WebhookRequestID string          `json:"webhook_request_id,omitempty"`
 	RawResponse      json.RawMessage `json:"raw_response,omitempty"`
@@ -65,6 +68,12 @@ type Record struct {
 	CreatedAt        time.Time       `json:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
+}
+
+type InputTrack struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	OffsetNanos int64  `json:"offset_nanos,omitempty"`
 }
 
 type Entry struct {
