@@ -221,6 +221,10 @@ No live ElevenLabs calls run in CI. Use `podscribe doctor` and a small local aud
 
 Read [AGENTS.md](AGENTS.md) for the repository layout, local workflow, testing expectations, JSON/stdout rules, and security guidance before opening a PR.
 
+## License
+
+podscribe is released under the [MIT License](LICENSE).
+
 ## Release
 
 Releases are tag-driven. To publish a release:
