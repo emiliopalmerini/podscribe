@@ -3,7 +3,7 @@ module github.com/emiliopalmerini/podscribe
 go 1.23
 
 require (
-	github.com/emiliopalmerini/elevenlabs-go v0.1.0
+	github.com/emiliopalmerini/elevenlabs-go v0.2.0
 	github.com/spf13/cobra v1.10.1
 )
 

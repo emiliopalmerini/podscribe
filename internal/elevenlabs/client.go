@@ -17,6 +17,7 @@ import (
 	"time"
 
 	el "github.com/emiliopalmerini/elevenlabs-go"
+	stt "github.com/emiliopalmerini/elevenlabs-go/speechtotext"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/transcription"
@@ -83,7 +84,7 @@ func (c *Client) UserID(ctx context.Context) (string, error) {
 }
 
 func (c *Client) Transcribe(ctx context.Context, req transcription.Request) (transcription.Transcript, error) {
-	client, err := c.sdkClient()
+	client, err := c.speechClient()
 	if err != nil {
 		return transcription.Transcript{}, err
 	}
@@ -101,7 +102,7 @@ func (c *Client) Transcribe(ctx context.Context, req transcription.Request) (tra
 }
 
 func (c *Client) SubmitWebhook(ctx context.Context, req transcription.Request) (transcription.WebhookResponse, error) {
-	client, err := c.sdkClient()
+	client, err := c.speechClient()
 	if err != nil {
 		return transcription.WebhookResponse{}, err
 	}
@@ -126,7 +127,7 @@ func (c *Client) SubmitWebhook(ctx context.Context, req transcription.Request) (
 }
 
 func (c *Client) GetTranscript(ctx context.Context, id string) (transcription.Transcript, error) {
-	client, err := c.sdkClient()
+	client, err := c.speechClient()
 	if err != nil {
 		return transcription.Transcript{}, err
 	}
@@ -138,7 +139,7 @@ func (c *Client) GetTranscript(ctx context.Context, id string) (transcription.Tr
 }
 
 func (c *Client) DeleteTranscript(ctx context.Context, id string) (any, error) {
-	client, err := c.sdkClient()
+	client, err := c.speechClient()
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +168,14 @@ func (c *Client) sdkClient() (*el.Client, error) {
 	), nil
 }
 
+func (c *Client) speechClient() (*stt.Client, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return nil, err
+	}
+	return stt.New(client), nil
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
@@ -188,10 +197,10 @@ func (c *Client) sdkRetryConfig() el.RetryConfig {
 	}
 }
 
-func sdkTranscriptRequest(req transcription.Request, file *os.File, size int64) el.CreateTranscriptRequest {
-	out := el.CreateTranscriptRequest{
+func sdkTranscriptRequest(req transcription.Request, file *os.File, size int64) stt.CreateTranscriptRequest {
+	out := stt.CreateTranscriptRequest{
 		ModelID:                 req.Model,
-		File:                    &el.File{Name: filepath.Base(req.FilePath), Reader: file, SizeBytes: size},
+		File:                    &stt.File{Name: filepath.Base(req.FilePath), Reader: file, SizeBytes: size},
 		LanguageCode:            req.Language,
 		TimestampsGranularity:   req.TimestampsGranularity,
 		NumSpeakers:             req.Speakers,
@@ -201,7 +210,7 @@ func sdkTranscriptRequest(req transcription.Request, file *os.File, size int64) 
 		Keyterms:                req.Keyterms,
 	}
 	if req.OnUploadProgress != nil {
-		out.OnUploadProgress = func(update el.UploadProgress) {
+		out.OnUploadProgress = func(update stt.UploadProgress) {
 			req.OnUploadProgress(transcription.UploadProgress{
 				SentBytes:  update.SentBytes,
 				TotalBytes: update.TotalBytes,
@@ -240,7 +249,7 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
-func convertTranscript(in *el.Transcript) (transcription.Transcript, error) {
+func convertTranscript(in *stt.Transcript) (transcription.Transcript, error) {
 	if in == nil {
 		return transcription.Transcript{}, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
 	}
