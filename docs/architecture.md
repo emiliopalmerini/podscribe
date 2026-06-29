@@ -5,7 +5,7 @@
 - `cmd/podscribe` is only process entrypoint glue.
 - `internal/cli` owns Cobra commands, flag validation, progress, and file writes.
 - `internal/config` owns config paths, auth precedence, and base URL resolution.
-- `internal/elevenlabs` owns request construction, streamed multipart upload, API errors, and typed transcript responses.
+- `internal/elevenlabs` wraps SDK client setup, local file upload helpers, API error normalization, and raw read-only requests; SDK types are the transcript/request contract.
 - `internal/jobstore` owns local resume/idempotency records, audio/request hashing, and atomic cache writes.
 - `internal/audiomerge` owns `ffprobe` duration inspection and `ffmpeg`-backed speaker-track multichannel merging or mixdown.
 - `internal/audioclip` owns `ffmpeg`-backed local audio segment extraction.
@@ -13,7 +13,7 @@
 - `internal/render` turns ElevenLabs word timing into editable Markdown transcript blocks.
 - `internal/output` owns the JSON envelope and secret redaction policy.
 
-The transcription upload uses `io.Pipe` with `multipart.Writer` so long podcast files are streamed to the HTTP request instead of buffered in memory. The ElevenLabs client reports file-byte progress through a callback, and the CLI renders that progress only on stderr so JSON stdout remains parseable.
+The ElevenLabs SDK streams transcription uploads instead of buffering long podcast files in memory. It reports file-byte progress through a callback, and the CLI renders that progress only on stderr so JSON stdout remains parseable.
 
 Speaker-track transcription is a pre-upload transform. The CLI hashes the ordered source track contents and offsets for cache identity, then uses `ffprobe` and `ffmpeg` to create a temporary FLAC only when a cache miss needs a new ElevenLabs upload. Default track mode preserves each file as a separate channel and sends ElevenLabs multichannel fields. `--track-mixdown` instead mixes the tracks into one normal audio upload and uses track names as default diarization speaker names. Track names stay local render metadata; they are not part of the remote request hash.
 

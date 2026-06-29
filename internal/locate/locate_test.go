@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emiliopalmerini/podscribe/internal/transcription"
+	"github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
 )
 
 func TestFindMatchesSelectedTextWithCopiedPrefixes(t *testing.T) {
@@ -13,8 +13,8 @@ func TestFindMatchesSelectedTextWithCopiedPrefixes(t *testing.T) {
 	start2, end2 := 2.0, 2.3
 	start3, end3 := 2.4, 2.7
 
-	resp := transcription.Transcript{
-		Words: []transcription.Word{
+	resp := &elevenlabs.Transcript{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Before", Type: "word", Start: &start0, End: &end0},
 			{Text: "Hello,", Type: "word", Start: &start1, End: &end1},
 			{Text: "world.", Type: "word", Start: &start2, End: &end2},
@@ -46,8 +46,8 @@ func TestFindMatchesMultilineSelection(t *testing.T) {
 	start1, end1 := 61.6, 61.9
 	start2, end2 := 62.0, 62.3
 
-	resp := transcription.Transcript{
-		Words: []transcription.Word{
+	resp := &elevenlabs.Transcript{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "First", Type: "word", Start: &start0, End: &end0},
 			{Text: "line.", Type: "word", Start: &start1, End: &end1},
 			{Text: "Second!", Type: "word", Start: &start2, End: &end2},
@@ -69,17 +69,17 @@ func TestFindReturnsRepeatedMatchesInTimeOrderWithLimit(t *testing.T) {
 	start2, end2 := 3.0, 3.2
 	channel0, channel1 := 0, 1
 
-	resp := transcription.Transcript{
-		Transcripts: []transcription.Transcript{
+	resp := &elevenlabs.Transcript{
+		Transcripts: []elevenlabs.Transcript{
 			{
 				ChannelIndex: &channel1,
-				Words: []transcription.Word{
+				Words: []elevenlabs.TranscriptWord{
 					{Text: "again", Type: "word", Start: &start2, End: &end2},
 				},
 			},
 			{
 				ChannelIndex: &channel0,
-				Words: []transcription.Word{
+				Words: []elevenlabs.TranscriptWord{
 					{Text: "again", Type: "word", Start: &start0, End: &end0},
 					{Text: "again", Type: "word", Start: &start1, End: &end1},
 				},
@@ -100,8 +100,8 @@ func TestFindReturnsRepeatedMatchesInTimeOrderWithLimit(t *testing.T) {
 }
 
 func TestFindReportsMissingWordTiming(t *testing.T) {
-	resp := transcription.Transcript{
-		Words: []transcription.Word{
+	resp := &elevenlabs.Transcript{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello", Type: "word"},
 			{Text: "world", Type: "word"},
 		},

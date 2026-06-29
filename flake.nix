@@ -30,7 +30,7 @@
             inherit version;
 
             src = ./.;
-            vendorHash = "sha256-hpAsYPhiYnTpY5Z7QZz9cr5RtleHnR1ezgoVaQ+cvp0=";
+            vendorHash = "sha256-clJQvhXNrQa7O+a5DiyFlkXL40IZaBonLGXy/5RA64Q=";
 
             subPackages = [ "cmd/podscribe" ];
             ldflags = [

@@ -12,13 +12,14 @@ import (
 	"sync"
 	"time"
 
+	sdk "github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
 	"github.com/spf13/cobra"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/audioclip"
 	"github.com/emiliopalmerini/podscribe/internal/audiomerge"
 	"github.com/emiliopalmerini/podscribe/internal/config"
-	"github.com/emiliopalmerini/podscribe/internal/elevenlabs"
+	elclient "github.com/emiliopalmerini/podscribe/internal/elevenlabs"
 	"github.com/emiliopalmerini/podscribe/internal/jobstore"
 	"github.com/emiliopalmerini/podscribe/internal/locate"
 	"github.com/emiliopalmerini/podscribe/internal/output"
@@ -98,8 +99,8 @@ func rootBoolFlag(args []string, name, shorthand string) bool {
 		if arg == longFlag || (shortFlag != "" && arg == shortFlag) {
 			return true
 		}
-		if strings.HasPrefix(arg, longPrefix) {
-			return strings.TrimPrefix(arg, longPrefix) == "true"
+		if after, ok := strings.CutPrefix(arg, longPrefix); ok {
+			return after == "true"
 		}
 		switch arg {
 		case "--api-key", "--base-url":
@@ -165,7 +166,7 @@ func newDoctorCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 				data["remote_check"] = "skipped_missing_auth"
 				data["setup"] = "Set ELEVENLABS_API_KEY or run podscribe init --api-key <key>."
 			} else {
-				client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+				client := elclient.NewClient(rt.BaseURL, rt.APIKey)
 				err := client.Check(ctx)
 				if err != nil {
 					data["remote_check"] = "failed"
@@ -326,7 +327,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 	if err != nil {
 		return err
 	}
-	client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+	client := elclient.NewClient(rt.BaseURL, rt.APIKey)
 	accountNamespace, namespaceSource, err := resolveAccountNamespace(ctx, client, rt.APIKey)
 	if err != nil {
 		return err
@@ -420,7 +421,16 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		return err
 	}
 
-	transcribeReq := buildTranscriptRequest(uploadPath, flags, keyterms, diarize, speakers, input.MultiChannel)
+	transcriptFile, closeTranscriptFile, _, err := elclient.OpenTranscriptFile(uploadPath)
+	if err != nil {
+		if shouldRecordTranscribeFailure(err) {
+			_, _ = saveFailedJob(record, err)
+		}
+		return err
+	}
+	defer closeTranscriptFile()
+
+	transcribeReq := buildTranscriptRequest(transcriptFile, flags, keyterms, diarize, speakers, input.MultiChannel)
 	if input.MultiChannel {
 		transcribeReq.MultichannelOutputStyle = "combined"
 	}
@@ -431,7 +441,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 			"podscribe_job_key":           jobKey,
 			"podscribe_account_namespace": accountNamespace,
 		}
-		return submitWebhookTranscription(ctx, opts, client, transcribeReq, audioSize, record, transcribeOutputMeta{
+		return submitWebhookTranscription(ctx, opts, client, uploadPath, transcribeReq, audioSize, record, transcribeOutputMeta{
 			JobKey:                 jobKey,
 			AccountNamespace:       accountNamespace,
 			AccountNamespaceSource: namespaceSource,
@@ -447,7 +457,7 @@ func runTranscribe(ctx context.Context, opts *rootOptions, flags transcribeFlags
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
 	transcribeReq.OnUploadProgress = progressCallback(progress)
-	transcript, err := client.Transcribe(ctx, transcribeReq)
+	transcript, err := client.CreateTranscript(ctx, transcribeReq)
 	if progress != nil {
 		progress.Stop()
 	}
@@ -504,19 +514,26 @@ func resolveAccountNamespace(ctx context.Context, provider transcription.Provide
 	return jobstore.APIKeyNamespace(apiKey), "api_key_hash", nil
 }
 
-func buildTranscriptRequest(uploadPath string, flags transcribeFlags, keyterms []string, diarize bool, speakers int, multiChannel bool) transcription.Request {
-	return transcription.Request{
-		FilePath:              uploadPath,
-		Model:                 flags.model,
-		Language:              flags.language,
-		Diarize:               diarize,
-		Speakers:              speakers,
+func buildTranscriptRequest(file *sdk.TranscriptFile, flags transcribeFlags, keyterms []string, diarize bool, speakers int, multiChannel bool) sdk.CreateTranscriptRequest {
+	req := sdk.CreateTranscriptRequest{
+		File:                  file,
+		ModelID:               flags.model,
+		LanguageCode:          flags.language,
+		NumSpeakers:           speakers,
 		Keyterms:              append([]string(nil), keyterms...),
-		Clean:                 flags.clean,
-		TagAudioEvents:        !flags.noAudioEvents,
+		TagAudioEvents:        boolPtr(!flags.noAudioEvents),
 		TimestampsGranularity: "word",
-		UseMultiChannel:       multiChannel,
 	}
+	if diarize {
+		req.Diarize = boolPtr(true)
+	}
+	if flags.clean {
+		req.NoVerbatim = boolPtr(true)
+	}
+	if multiChannel {
+		req.UseMultiChannel = boolPtr(true)
+	}
+	return req
 }
 
 func resolveTranscribeInput(flags transcribeFlags, audioPath string) (transcribeInput, error) {
@@ -749,14 +766,14 @@ func writeTrackMixdownMap(w io.Writer, tracks []audiomerge.Track) {
 	}
 }
 
-func submitWebhookTranscription(ctx context.Context, opts *rootOptions, provider transcription.Provider, transcribeReq transcription.Request, audioSize int64, record jobstore.Record, meta transcribeOutputMeta) error {
+func submitWebhookTranscription(ctx context.Context, opts *rootOptions, provider transcription.Provider, uploadPath string, transcribeReq sdk.CreateTranscriptRequest, audioSize int64, record jobstore.Record, meta transcribeOutputMeta) error {
 	var progress *transcribeProgressPrinter
 	if !opts.json {
-		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs webhook...\n", transcribeReq.FilePath, formatBytes(audioSize))
+		fmt.Fprintf(opts.errOut, "Uploading %s (%s) to ElevenLabs webhook...\n", uploadPath, formatBytes(audioSize))
 		progress = newTranscribeProgressPrinter(opts.errOut)
 	}
 	transcribeReq.OnUploadProgress = progressCallback(progress)
-	response, err := provider.SubmitWebhook(ctx, transcribeReq)
+	response, err := provider.SubmitTranscriptWebhook(ctx, transcribeReq)
 	if progress != nil {
 		progress.Stop()
 	}
@@ -765,6 +782,9 @@ func submitWebhookTranscription(ctx context.Context, opts *rootOptions, provider
 			_, _ = saveFailedJob(record, err)
 		}
 		return err
+	}
+	if response == nil {
+		return apperr.New(apperr.CodeAPI, "ElevenLabs webhook response was empty")
 	}
 
 	record.Status = jobstore.StatusSubmitted
@@ -820,18 +840,21 @@ func saveFailedJob(record jobstore.Record, err error) (string, error) {
 	return jobstore.Save(record)
 }
 
-func transcriptFromRaw(raw []byte, source string) (transcription.Transcript, []byte, error) {
+func transcriptFromRaw(raw []byte, source string) (*sdk.Transcript, []byte, error) {
 	if len(raw) == 0 {
-		return transcription.Transcript{}, nil, apperr.New(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is missing raw response; use --force to submit a new request", source))
+		return nil, nil, apperr.New(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is missing raw response; use --force to submit a new request", source))
 	}
-	var transcript transcription.Transcript
+	var transcript sdk.Transcript
 	if err := json.Unmarshal(raw, &transcript); err != nil {
-		return transcription.Transcript{}, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is not valid transcript JSON; use --force to submit a new request", source), err)
+		return nil, nil, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("cached transcript at %s is not valid transcript JSON; use --force to submit a new request", source), err)
 	}
-	return transcript, append([]byte(nil), raw...), nil
+	return &transcript, append([]byte(nil), raw...), nil
 }
 
-func transcriptJSON(transcript transcription.Transcript) ([]byte, error) {
+func transcriptJSON(transcript *sdk.Transcript) ([]byte, error) {
+	if transcript == nil {
+		return nil, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
+	}
 	raw, err := json.Marshal(transcript)
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeAPI, "could not encode transcript JSON", err)
@@ -839,7 +862,7 @@ func transcriptJSON(transcript transcription.Transcript) ([]byte, error) {
 	return raw, nil
 }
 
-func writeTranscriptOutputs(opts *rootOptions, flags transcribeFlags, audioPath, outPath string, transcript transcription.Transcript, raw []byte, renderReq jobstore.RenderRequest, meta transcribeOutputMeta) error {
+func writeTranscriptOutputs(opts *rootOptions, flags transcribeFlags, audioPath, outPath string, transcript *sdk.Transcript, raw []byte, renderReq jobstore.RenderRequest, meta transcribeOutputMeta) error {
 	if !opts.json {
 		if meta.ReusedCache {
 			fmt.Fprintf(opts.errOut, "Reusing cached ElevenLabs transcript from %s\n", meta.CachePath)
@@ -924,7 +947,7 @@ func newTranscriptGetCommand(ctx context.Context, opts *rootOptions) *cobra.Comm
 			if err != nil {
 				return err
 			}
-			provider := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+			provider := elclient.NewClient(rt.BaseURL, rt.APIKey)
 			transcript, err := provider.GetTranscript(ctx, args[0])
 			if err != nil {
 				return err
@@ -977,8 +1000,8 @@ func newTranscriptDeleteCommand(ctx context.Context, opts *rootOptions) *cobra.C
 			if err != nil {
 				return err
 			}
-			provider := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
-			response, err := provider.DeleteTranscript(ctx, args[0])
+			provider := elclient.NewClient(rt.BaseURL, rt.APIKey)
+			response, err := provider.DeleteTranscriptWithResponse(ctx, args[0])
 			if err != nil {
 				return err
 			}
@@ -986,8 +1009,8 @@ func newTranscriptDeleteCommand(ctx context.Context, opts *rootOptions) *cobra.C
 				"transcription_id": args[0],
 				"deleted":          true,
 			}
-			if response != nil {
-				data["response"] = response
+			if response != nil && response.Data != nil {
+				data["response"] = response.Data
 			}
 			if opts.json {
 				return output.JSONSuccess(opts.out, data)
@@ -1298,7 +1321,7 @@ func newRequestCommand(ctx context.Context, opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			client := elevenlabs.NewClient(rt.BaseURL, rt.APIKey)
+			client := elclient.NewClient(rt.BaseURL, rt.APIKey)
 			raw, err := client.RawGet(ctx, args[0])
 			if err != nil {
 				return err
@@ -1476,6 +1499,10 @@ func optionalString(value string) any {
 	return value
 }
 
+func boolPtr(value bool) *bool {
+	return &value
+}
+
 func firstNonEmptyString(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1611,14 +1638,14 @@ func newTranscribeProgressPrinter(w io.Writer) *transcribeProgressPrinter {
 	}
 }
 
-func progressCallback(progress *transcribeProgressPrinter) func(transcription.UploadProgress) {
+func progressCallback(progress *transcribeProgressPrinter) func(sdk.TranscriptUploadProgress) {
 	if progress == nil {
 		return nil
 	}
 	return progress.ReportUpload
 }
 
-func (p *transcribeProgressPrinter) ReportUpload(progress transcription.UploadProgress) {
+func (p *transcribeProgressPrinter) ReportUpload(progress sdk.TranscriptUploadProgress) {
 	if progress.SentBytes == 0 {
 		return
 	}

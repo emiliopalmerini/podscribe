@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emiliopalmerini/podscribe/internal/transcription"
+	"github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
 )
 
 func TestMarkdownRendersDiarizedTurns(t *testing.T) {
@@ -14,12 +14,12 @@ func TestMarkdownRendersDiarizedTurns(t *testing.T) {
 	start2, end2 := 6.0, 6.3
 	duration := 10.0
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:        "en",
 		LanguageProbability: 0.98,
 		TranscriptionID:     "tx_123",
 		AudioDurationSecs:   &duration,
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
 			{Text: "world.", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_0"},
 			{Text: "Thanks!", Type: "word", Start: &start2, End: &end2, SpeakerID: "speaker_1"},
@@ -53,10 +53,10 @@ func TestMarkdownRendersDiarizedTurns(t *testing.T) {
 func TestMarkdownRendersTimestampsWhenRequested(t *testing.T) {
 	start, end := 61.2, 61.7
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:    "en",
 		TranscriptionID: "tx_123",
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello.", Type: "word", Start: &start, End: &end, SpeakerID: "speaker_0"},
 		},
 	}, MarkdownOptions{
@@ -78,10 +78,10 @@ func TestMarkdownRendersNamedSpeakers(t *testing.T) {
 	start0, end0 := 1.2, 1.7
 	start1, end1 := 2.0, 2.4
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:    "en",
 		TranscriptionID: "tx_123",
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
 			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
 		},
@@ -111,10 +111,10 @@ func TestMarkdownFallsBackForUnnamedSpeakers(t *testing.T) {
 	start0, end0 := 1.2, 1.7
 	start1, end1 := 2.0, 2.4
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:    "en",
 		TranscriptionID: "tx_123",
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
 			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
 		},
@@ -140,10 +140,10 @@ func TestMarkdownFallsBackForUnnamedSpeakers(t *testing.T) {
 func TestMarkdownRendersNamedSpeakerWithTimestamps(t *testing.T) {
 	start, end := 61.2, 61.7
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:    "en",
 		TranscriptionID: "tx_123",
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello.", Type: "word", Start: &start, End: &end, SpeakerID: "speaker_0"},
 		},
 	}, MarkdownOptions{
@@ -167,19 +167,19 @@ func TestMarkdownKeepsSpeakerLabelsStableAcrossChunks(t *testing.T) {
 	start1, end1 := 2.0, 2.4
 	channel0, channel1 := 0, 1
 
-	got := Markdown(transcription.Transcript{
-		Transcripts: []transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
+		Transcripts: []elevenlabs.Transcript{
 			{
 				LanguageCode: "en",
 				ChannelIndex: &channel0,
-				Words: []transcription.Word{
+				Words: []elevenlabs.TranscriptWord{
 					{Text: "Hello.", Type: "word", Start: &start0, End: &end0, SpeakerID: "speaker_0"},
 				},
 			},
 			{
 				LanguageCode: "en",
 				ChannelIndex: &channel1,
-				Words: []transcription.Word{
+				Words: []elevenlabs.TranscriptWord{
 					{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, SpeakerID: "speaker_1"},
 				},
 			},
@@ -211,10 +211,10 @@ func TestMarkdownRendersCombinedMultichannelWordsWithTrackNames(t *testing.T) {
 	start2, end2 := 3.0, 3.2
 	channel0, channel1 := 0, 1
 
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode:    "en",
 		TranscriptionID: "tx_123",
-		Words: []transcription.Word{
+		Words: []elevenlabs.TranscriptWord{
 			{Text: "Hello.", Type: "word", Start: &start0, End: &end0, ChannelIndex: &channel0},
 			{Text: "Thanks!", Type: "word", Start: &start1, End: &end1, ChannelIndex: &channel1},
 			{Text: "Again.", Type: "word", Start: &start2, End: &end2, ChannelIndex: &channel0},
@@ -240,7 +240,7 @@ func TestMarkdownRendersCombinedMultichannelWordsWithTrackNames(t *testing.T) {
 }
 
 func TestMarkdownFallsBackToPlainText(t *testing.T) {
-	got := Markdown(transcription.Transcript{
+	got := Markdown(&elevenlabs.Transcript{
 		LanguageCode: "en",
 		Text:         "A simple transcript.",
 	}, MarkdownOptions{Title: "Plain", SourceFile: "plain.mp3", Model: "scribe_v2"})

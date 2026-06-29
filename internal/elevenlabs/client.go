@@ -3,7 +3,6 @@ package elevenlabs
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +15,7 @@ import (
 	"strings"
 	"time"
 
-	el "github.com/emiliopalmerini/elevenlabs-go"
-	stt "github.com/emiliopalmerini/elevenlabs-go/speechtotext"
+	el "github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/transcription"
@@ -59,7 +57,7 @@ func (c *Client) Check(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := client.ListModels(ctx); err != nil {
+	if _, err := client.Models.List(ctx); err != nil {
 		return wrapSDKError(err, "")
 	}
 	return nil
@@ -70,7 +68,7 @@ func (c *Client) UserID(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	user, err := client.GetUser(ctx)
+	user, err := client.User.GetUser(ctx)
 	if err != nil {
 		return "", wrapSDKError(err, "")
 	}
@@ -83,74 +81,61 @@ func (c *Client) UserID(ctx context.Context) (string, error) {
 	return user.UserID, nil
 }
 
-func (c *Client) Transcribe(ctx context.Context, req transcription.Request) (transcription.Transcript, error) {
-	client, err := c.speechClient()
-	if err != nil {
-		return transcription.Transcript{}, err
-	}
-	file, size, err := openAudioFile(req.FilePath)
-	if err != nil {
-		return transcription.Transcript{}, err
-	}
-	defer file.Close()
-
-	transcript, err := client.CreateTranscript(ctx, sdkTranscriptRequest(req, file, size))
-	if err != nil {
-		return transcription.Transcript{}, wrapSDKError(err, "could not parse ElevenLabs transcript response")
-	}
-	return convertTranscript(transcript)
-}
-
-func (c *Client) SubmitWebhook(ctx context.Context, req transcription.Request) (transcription.WebhookResponse, error) {
-	client, err := c.speechClient()
-	if err != nil {
-		return transcription.WebhookResponse{}, err
-	}
-	file, size, err := openAudioFile(req.FilePath)
-	if err != nil {
-		return transcription.WebhookResponse{}, err
-	}
-	defer file.Close()
-
-	response, err := client.SubmitTranscriptWebhook(ctx, sdkTranscriptRequest(req, file, size))
-	if err != nil {
-		return transcription.WebhookResponse{}, wrapSDKError(err, "could not parse ElevenLabs webhook response")
-	}
-	if response == nil {
-		return transcription.WebhookResponse{}, apperr.New(apperr.CodeAPI, "ElevenLabs webhook response was empty")
-	}
-	return transcription.WebhookResponse{
-		Message:         response.Message,
-		RequestID:       response.RequestID,
-		TranscriptionID: response.TranscriptionID,
-	}, nil
-}
-
-func (c *Client) GetTranscript(ctx context.Context, id string) (transcription.Transcript, error) {
-	client, err := c.speechClient()
-	if err != nil {
-		return transcription.Transcript{}, err
-	}
-	transcript, err := client.GetTranscript(ctx, id)
-	if err != nil {
-		return transcription.Transcript{}, wrapSDKError(err, "could not parse ElevenLabs transcript response")
-	}
-	return convertTranscript(transcript)
-}
-
-func (c *Client) DeleteTranscript(ctx context.Context, id string) (any, error) {
-	client, err := c.speechClient()
+func (c *Client) CreateTranscript(ctx context.Context, req el.CreateTranscriptRequest) (*el.Transcript, error) {
+	client, err := c.sdkClient()
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.DeleteTranscriptWithResponse(ctx, id)
+	transcript, err := client.STT.CreateTranscript(ctx, req)
+	if err != nil {
+		return nil, wrapSDKError(err, "could not parse ElevenLabs transcript response")
+	}
+	if transcript == nil {
+		return nil, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
+	}
+	return transcript, nil
+}
+
+func (c *Client) SubmitTranscriptWebhook(ctx context.Context, req el.CreateTranscriptRequest) (*el.TranscriptWebhookResponse, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.STT.SubmitTranscriptWebhook(ctx, req)
+	if err != nil {
+		return nil, wrapSDKError(err, "could not parse ElevenLabs webhook response")
+	}
+	if response == nil {
+		return nil, apperr.New(apperr.CodeAPI, "ElevenLabs webhook response was empty")
+	}
+	return response, nil
+}
+
+func (c *Client) GetTranscript(ctx context.Context, id string) (*el.Transcript, error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return nil, err
+	}
+	transcript, err := client.STT.GetTranscript(ctx, id)
+	if err != nil {
+		return nil, wrapSDKError(err, "could not parse ElevenLabs transcript response")
+	}
+	if transcript == nil {
+		return nil, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
+	}
+	return transcript, nil
+}
+
+func (c *Client) DeleteTranscriptWithResponse(ctx context.Context, id string) (*el.Response[any], error) {
+	client, err := c.sdkClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.STT.DeleteTranscriptWithResponse(ctx, id)
 	if err != nil {
 		return nil, wrapSDKError(err, "")
 	}
-	if resp == nil {
-		return nil, nil
-	}
-	return resp.Data, nil
+	return resp, nil
 }
 
 func (c *Client) sdkClient() (*el.Client, error) {
@@ -166,14 +151,6 @@ func (c *Client) sdkClient() (*el.Client, error) {
 		el.WithHTTPClient(c.httpClient()),
 		el.WithRetryConfig(c.sdkRetryConfig()),
 	), nil
-}
-
-func (c *Client) speechClient() (*stt.Client, error) {
-	client, err := c.sdkClient()
-	if err != nil {
-		return nil, err
-	}
-	return stt.New(client), nil
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -197,39 +174,16 @@ func (c *Client) sdkRetryConfig() el.RetryConfig {
 	}
 }
 
-func sdkTranscriptRequest(req transcription.Request, file *os.File, size int64) stt.CreateTranscriptRequest {
-	out := stt.CreateTranscriptRequest{
-		ModelID:                 req.Model,
-		File:                    &stt.File{Name: filepath.Base(req.FilePath), Reader: file, SizeBytes: size},
-		LanguageCode:            req.Language,
-		TimestampsGranularity:   req.TimestampsGranularity,
-		NumSpeakers:             req.Speakers,
-		WebhookID:               req.WebhookID,
-		WebhookMetadata:         req.WebhookMetadata,
-		MultichannelOutputStyle: req.MultichannelOutputStyle,
-		Keyterms:                req.Keyterms,
+func OpenTranscriptFile(path string) (*el.TranscriptFile, func() error, int64, error) {
+	file, size, err := openAudioFile(path)
+	if err != nil {
+		return nil, nil, 0, err
 	}
-	if req.OnUploadProgress != nil {
-		out.OnUploadProgress = func(update stt.UploadProgress) {
-			req.OnUploadProgress(transcription.UploadProgress{
-				SentBytes:  update.SentBytes,
-				TotalBytes: update.TotalBytes,
-				Done:       update.Done,
-				Attempt:    update.Attempt,
-			})
-		}
-	}
-	if req.Diarize {
-		out.Diarize = boolPtr(true)
-	}
-	out.TagAudioEvents = boolPtr(req.TagAudioEvents)
-	if req.Clean {
-		out.NoVerbatim = boolPtr(true)
-	}
-	if req.UseMultiChannel {
-		out.UseMultiChannel = boolPtr(true)
-	}
-	return out
+	return &el.TranscriptFile{
+		Name:      filepath.Base(path),
+		Reader:    file,
+		SizeBytes: size,
+	}, file.Close, size, nil
 }
 
 func openAudioFile(path string) (*os.File, int64, error) {
@@ -243,29 +197,6 @@ func openAudioFile(path string) (*os.File, int64, error) {
 		return nil, 0, apperr.Wrap(apperr.CodeFilesystem, fmt.Sprintf("could not inspect audio file %s", path), err)
 	}
 	return file, info.Size(), nil
-}
-
-func boolPtr(v bool) *bool {
-	return &v
-}
-
-func convertTranscript(in *stt.Transcript) (transcription.Transcript, error) {
-	if in == nil {
-		return transcription.Transcript{}, apperr.New(apperr.CodeAPI, "ElevenLabs transcript response was empty")
-	}
-	var out transcription.Transcript
-	if err := convertJSON(in, &out); err != nil {
-		return transcription.Transcript{}, apperr.Wrap(apperr.CodeAPI, "could not convert ElevenLabs transcript response", err)
-	}
-	return out, nil
-}
-
-func convertJSON(in, out any) error {
-	raw, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(raw, out)
 }
 
 func RawGetClient(baseURL, apiKey string) *Client {

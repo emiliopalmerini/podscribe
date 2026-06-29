@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	el "github.com/emiliopalmerini/elevenlabs-go"
+	el "github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
 
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
 	"github.com/emiliopalmerini/podscribe/internal/output"

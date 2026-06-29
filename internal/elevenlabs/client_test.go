@@ -13,8 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	sdk "github.com/emiliopalmerini/elevenlabs-go/elevenlabs"
+
 	"github.com/emiliopalmerini/podscribe/internal/apperr"
-	"github.com/emiliopalmerini/podscribe/internal/transcription"
 )
 
 func TestTranscribeStreamsMultipartRequest(t *testing.T) {
@@ -79,23 +80,23 @@ func TestTranscribeStreamsMultipartRequest(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	var progress []transcription.UploadProgress
-	resp, err := client.Transcribe(context.Background(), transcription.Request{
-		FilePath:              audio,
-		Model:                 "scribe_v2",
-		Language:              "en",
-		Diarize:               true,
-		Speakers:              2,
+	var progress []sdk.TranscriptUploadProgress
+	resp, err := client.CreateTranscript(context.Background(), sdk.CreateTranscriptRequest{
+		File:                  transcriptFileForTest(t, audio),
+		ModelID:               "scribe_v2",
+		LanguageCode:          "en",
+		Diarize:               boolPtr(true),
+		NumSpeakers:           2,
 		Keyterms:              []string{"Emilio", "Podscribe"},
-		Clean:                 true,
-		TagAudioEvents:        false,
+		NoVerbatim:            boolPtr(true),
+		TagAudioEvents:        boolPtr(false),
 		TimestampsGranularity: "word",
-		OnUploadProgress: func(update transcription.UploadProgress) {
+		OnUploadProgress: func(update sdk.TranscriptUploadProgress) {
 			progress = append(progress, update)
 		},
 	})
 	if err != nil {
-		t.Fatalf("Transcribe() error = %v", err)
+		t.Fatalf("CreateTranscript() error = %v", err)
 	}
 	if !sawRequest {
 		t.Fatal("server did not receive request")
@@ -161,16 +162,16 @@ func TestTranscribeSendsMultichannelFields(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	_, err := client.Transcribe(context.Background(), transcription.Request{
-		FilePath:                audio,
-		Model:                   "scribe_v2",
-		TagAudioEvents:          true,
+	_, err := client.CreateTranscript(context.Background(), sdk.CreateTranscriptRequest{
+		File:                    transcriptFileForTest(t, audio),
+		ModelID:                 "scribe_v2",
+		TagAudioEvents:          boolPtr(true),
 		TimestampsGranularity:   "word",
-		UseMultiChannel:         true,
+		UseMultiChannel:         boolPtr(true),
 		MultichannelOutputStyle: "combined",
 	})
 	if err != nil {
-		t.Fatalf("Transcribe() error = %v", err)
+		t.Fatalf("CreateTranscript() error = %v", err)
 	}
 	assertField(t, fields, "use_multi_channel", "true")
 	assertField(t, fields, "multichannel_output_style", "combined")
@@ -202,8 +203,8 @@ func TestGetDeleteAndRawGET(t *testing.T) {
 	if _, err := client.GetTranscript(context.Background(), "tx_123"); err != nil {
 		t.Fatalf("GetTranscript() error = %v", err)
 	}
-	if _, err := client.DeleteTranscript(context.Background(), "tx_123"); err != nil {
-		t.Fatalf("DeleteTranscript() error = %v", err)
+	if _, err := client.DeleteTranscriptWithResponse(context.Background(), "tx_123"); err != nil {
+		t.Fatalf("DeleteTranscriptWithResponse() error = %v", err)
 	}
 	if _, err := client.RawGet(context.Background(), "/v1/models?limit=1"); err != nil {
 		t.Fatalf("RawGet() error = %v", err)
@@ -287,10 +288,10 @@ func TestSubmitWebhookSendsMetadata(t *testing.T) {
 	client := NewClient(server.URL, "test-key")
 	client.HTTPClient = server.Client()
 
-	resp, err := client.SubmitWebhook(context.Background(), transcription.Request{
-		FilePath:              audio,
-		Model:                 "scribe_v2",
-		TagAudioEvents:        true,
+	resp, err := client.SubmitTranscriptWebhook(context.Background(), sdk.CreateTranscriptRequest{
+		File:                  transcriptFileForTest(t, audio),
+		ModelID:               "scribe_v2",
+		TagAudioEvents:        boolPtr(true),
 		TimestampsGranularity: "word",
 		WebhookID:             "wh_123",
 		WebhookMetadata: map[string]any{
@@ -298,7 +299,7 @@ func TestSubmitWebhookSendsMetadata(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("SubmitWebhook() error = %v", err)
+		t.Fatalf("SubmitTranscriptWebhook() error = %v", err)
 	}
 	if resp.RequestID != "req_123" || resp.TranscriptionID == nil || *resp.TranscriptionID != "tx_123" {
 		t.Fatalf("webhook response = %+v", resp)
@@ -440,14 +441,14 @@ func TestTranscribeRetriesConnectionErrorsWithFreshMultipartRequest(t *testing.T
 		return jsonResponse(req, http.StatusOK, `{"language_code":"en","text":"Hello","words":[],"transcription_id":"tx_123"}`), nil
 	})}
 
-	resp, err := client.Transcribe(context.Background(), transcription.Request{
-		FilePath:              audio,
-		Model:                 "scribe_v2",
-		TagAudioEvents:        true,
+	resp, err := client.CreateTranscript(context.Background(), sdk.CreateTranscriptRequest{
+		File:                  transcriptFileForTest(t, audio),
+		ModelID:               "scribe_v2",
+		TagAudioEvents:        boolPtr(true),
 		TimestampsGranularity: "word",
 	})
 	if err != nil {
-		t.Fatalf("Transcribe() error = %v", err)
+		t.Fatalf("CreateTranscript() error = %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
@@ -610,6 +611,22 @@ func assertField(t *testing.T, fields map[string][]string, name, want string) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("%s = %#v, want %q", name, got, want)
 	}
+}
+
+func transcriptFileForTest(t *testing.T, path string) *sdk.TranscriptFile {
+	t.Helper()
+	file, closeFile, _, err := OpenTranscriptFile(path)
+	if err != nil {
+		t.Fatalf("open transcript file: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = closeFile()
+	})
+	return file
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func osWriteFile(name string, data []byte) error {
